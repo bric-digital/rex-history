@@ -1,0 +1,45 @@
+{
+    "name": "@bric/webmunk-history",
+    "version": "0.0.1",
+    "description": "Webmunk module for collecting browser history data via Chrome History API.",
+    "keywords": [
+        "extension",
+        "webmunk",
+        "history",
+        "browsing-data"
+    ],
+    "author": "Behavioral Research Innovation Center",
+    "type": "module",
+    "homepage": "https://github.com/bric-digital/webmunk-history",
+    "bugs": {
+        "url": "https://github.com/bric-digital/webmunk-history/issues"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/bric-digital/webmunk-history.git"
+    },
+    "exports": {
+        "./extension": "./src/extension.mts",
+        "./browser": "./src/browser.mts",
+        "./service-worker": "./src/service-worker.mts"
+    },
+    "scripts": {
+        "build": "tsc",
+        "lint": "eslint src"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.1",
+        "@types/jquery": "^3.5.33",
+        "chrome-types": "^0.1.387",
+        "eslint": "^9.39.1",
+        "globals": "^16.5.0",
+        "jiti": "^2.6.1",
+        "typescript": "^5.9.2",
+        "typescript-eslint": "^8.46.3"
+    },
+    "dependencies": {
+        "@bric/webmunk-core": "github:bric-digital/webmunk-core",
+        "jquery": "^3.7.1",
+        "psl": "^1.9.0"
+    }
+}
