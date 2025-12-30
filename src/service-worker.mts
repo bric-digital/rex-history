@@ -1,4 +1,3 @@
-// @ts-expect-error - psl module resolution issue with TypeScript
 import psl from 'psl'
 import { WebmunkServiceWorkerModule, registerWebmunkModule } from '@bric/webmunk-core/service-worker'
 import * as listUtils from '@bric/webmunk-core/list-utilities'
@@ -78,8 +77,15 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
   async loadConfiguration() {
     try {
-      const result = await chrome.storage.local.get('webmunkConfiguration')
-      const config = result.webmunkConfiguration
+      // Try the history-specific key first (AI-Extension uses this)
+      let result = await chrome.storage.local.get('webmunkHistoryConfiguration')
+      let config = result.webmunkHistoryConfiguration
+
+      // Fallback to the general configuration key for compatibility
+      if (!config) {
+        result = await chrome.storage.local.get('webmunkConfiguration')
+        config = result.webmunkConfiguration
+      }
 
       if (config && config.history) {
         this.config = config.history as HistoryConfig
@@ -357,7 +363,10 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
   }
 
   handleMessage(message: { messageType: string; [key: string]: unknown }, sender: chrome.runtime.MessageSender, sendResponse: (response: unknown) => void): boolean {
+    console.log('[webmunk-history] Received message:', message.messageType)
+
     if (message.messageType === 'triggerHistoryCollection') {
+      console.log('[webmunk-history] Triggering manual collection')
       this.collectHistory().then(() => {
         sendResponse({ success: true })
       }).catch((error) => {
@@ -367,10 +376,12 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     }
 
     if (message.messageType === 'getHistoryStatus') {
+      console.log('[webmunk-history] Sending status:', this.status)
       sendResponse(this.status)
       return false
     }
 
+    console.log('[webmunk-history] Unknown message type, not handling')
     return false
   }
 
