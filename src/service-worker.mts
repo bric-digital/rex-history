@@ -1,5 +1,5 @@
 import psl from 'psl'
-import { WebmunkServiceWorkerModule, registerWebmunkModule } from '@bric/webmunk-core/service-worker'
+import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/webmunk-core/service-worker'
 import * as listUtils from '@bric/webmunk-core/list-utilities'
 
 interface HistoryConfig {
@@ -16,6 +16,8 @@ interface HistoryStatus {
   lastCollectionTime?: number;
   itemsCollected: number;
   isCollecting: boolean;
+  configSource?: 'local_override' | 'server' | 'none';
+  effectiveConfig?: HistoryConfig;
 }
 
 /**
@@ -27,6 +29,15 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     itemsCollected: 0,
     isCollecting: false
   }
+
+  /**
+   * DEV-ONLY debug flag:
+   * When enabled (and running inside Webmunk Dev Extension), we emit a dataset event
+   * containing the *full* original URL for filtered items so you can verify list behavior.
+   *
+   * This is explicitly blocked outside the dev extension to prevent accidental deployment.
+   */
+  private static readonly DEBUG_LOG_FILTERED_URLS_KEY = 'webmunk_debug_log_filtered_urls'
 
   constructor() {
     super()
@@ -73,25 +84,54 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
     // Load status from storage
     await this.loadStatus()
+
+    // Ensure status reflects current effective configuration + source
+    await this.loadConfiguration()
   }
 
   async loadConfiguration() {
     try {
-      // Try the history-specific key first (AI-Extension uses this)
-      let result = await chrome.storage.local.get('webmunkHistoryConfiguration')
-      let config = result.webmunkHistoryConfiguration
+      // Base config typically comes from the server-provided config (stored by webmunk-core)
+      const baseResult = await chrome.storage.local.get('webmunkConfiguration')
+      const baseConfig = baseResult.webmunkConfiguration as { history?: HistoryConfig } | undefined
 
-      // Fallback to the general configuration key for compatibility
-      if (!config) {
-        result = await chrome.storage.local.get('webmunkConfiguration')
-        config = result.webmunkConfiguration
+      // Optional local override (often injected by an extension's service worker from its bundled config.json)
+      const overrideResult = await chrome.storage.local.get('webmunkHistoryConfiguration')
+      const overrideConfig = overrideResult.webmunkHistoryConfiguration as { history?: HistoryConfig } | undefined
+
+      const baseHistory = baseConfig?.history
+      const overrideHistory = overrideConfig?.history
+
+      // Effective config rule:
+      // - If overrideHistory exists, it overrides baseHistory field-by-field
+      // - Else fall back to baseHistory
+      let effectiveHistory: HistoryConfig | undefined
+      let source: HistoryStatus['configSource'] = 'none'
+
+      if (overrideHistory) {
+        effectiveHistory = { ...(baseHistory ?? {}), ...overrideHistory } as HistoryConfig
+        source = 'local_override'
+      } else if (baseHistory) {
+        effectiveHistory = baseHistory
+        source = 'server'
       }
 
-      if (config && config.history) {
-        this.config = config.history as HistoryConfig
-        console.log('[webmunk-history] Configuration loaded:', this.config)
+      if (effectiveHistory) {
+        this.config = effectiveHistory
+        this.status.configSource = source
+        this.status.effectiveConfig = effectiveHistory
+        await this.saveStatus()
+
+        console.log('[webmunk-history] Effective configuration loaded:', effectiveHistory)
+        if (source === 'local_override') {
+          console.warn('[webmunk-history] Using LOCAL override config (webmunkHistoryConfiguration.history) over server config (webmunkConfiguration.history)')
+        }
       } else {
-        console.warn('[webmunk-history] No history configuration found')
+        this.config = null
+        this.status.configSource = 'none'
+        delete this.status.effectiveConfig
+        await this.saveStatus()
+        console.warn('[webmunk-history] No history configuration found (neither override nor server config)')
       }
     } catch (error) {
       console.error('[webmunk-history] Failed to load configuration:', error)
@@ -169,6 +209,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
       return
     }
 
+    // Re-load configuration so server updates / local overrides are reflected at collection time
+    await this.loadConfiguration()
+
     if (!this.config) {
       console.warn('[webmunk-history] No configuration available, skipping collection')
       return
@@ -213,15 +256,26 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           // Categorize against category lists
           const categories = await this.categorizeUrl(item.url)
 
-          // Log event
-          this.logEvent({
+          // Dispatch event to all modules (PDK will pick it up for upload)
+          console.log('[webmunk-history] Logging event: webmunk-history-visit')
+          dispatchEvent({
             name: 'webmunk-history-visit',
             url: item.url,
             title: item.title || '',
             visit_time: visit.visitTime,
             transition: visit.transition,
             categories: categories,
-            date: visit.visitTime
+            date: visit.visitTime,
+
+            // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
+            visit_id: visit.visitId,
+            referring_visit_id: visit.referringVisitId,
+
+            // URL-level history item fields (useful context, low cost)
+            history_item_id: item.id,
+            last_visit_time: item.lastVisitTime,
+            visit_count: item.visitCount,
+            typed_count: item.typedCount
           })
 
           collectedCount++
@@ -269,6 +323,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
         const match = await listUtils.matchDomainAgainstList(url, listName)
         if (match) {
           console.log(`[webmunk-history] Filtered URL ${url} by list ${listName}`)
+          await this.maybeLogFilteredUrlDebug(url, listName, match)
           return true
         }
       } catch (error) {
@@ -277,6 +332,42 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     }
 
     return false
+  }
+
+  private isDevExtension(): boolean {
+    try {
+      return chrome.runtime.getManifest().name === 'Webmunk Dev Extension'
+    } catch {
+      return false
+    }
+  }
+
+  private async maybeLogFilteredUrlDebug(url: string, listName: string, match: listUtils.ListEntry): Promise<void> {
+    // Hard safety gate: never allow full-URL debug logging outside the dev extension.
+    const { [HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY]: enabled } =
+      await chrome.storage.local.get(HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY)
+
+    if (!this.isDevExtension()) {
+      if (enabled === true) {
+        console.warn('[webmunk-history] Debug URL logging was enabled, but this is not the dev extension. Disabling.')
+        await chrome.storage.local.remove(HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY)
+      }
+      return
+    }
+
+    if (enabled !== true) return
+
+    // Emit a debug event that Passive Data Kit will capture.
+    dispatchEvent({
+      name: 'webmunk-history-filtered-url-debug',
+      url,
+      filtered_by_list: listName,
+      matched_pattern: match.domain,
+      matched_pattern_type: match.pattern_type,
+      matched_source: match.source,
+      matched_metadata: match.metadata || {},
+      date: Date.now()
+    })
   }
 
   async categorizeUrl(url: string): Promise<string[]> {
@@ -323,7 +414,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
           // Use psl to extract registered domain
           const parsed = psl.parse(hostname)
-          const domain = parsed.domain || hostname
+          const domain = (parsed.error === undefined && 'domain' in parsed && parsed.domain) ? parsed.domain : hostname
 
           // Increment count
           const currentCount = domainCounts.get(domain) || 0
@@ -385,11 +476,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     return false
   }
 
-  logEvent(event: { name: string; [key: string]: unknown }) {
-    console.log('[webmunk-history] Logging event:', event.name)
-    // Events are automatically logged via the parent class
-    // which will be picked up by webmunk-passive-data-kit
-  }
+  // Note: This module does NOT respond to events, only sends them
+  // The logEvent method is intentionally not implemented to avoid infinite recursion
+  // when dispatchEvent() is called
 }
 
 const plugin = new HistoryServiceWorkerModule()
