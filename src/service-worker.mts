@@ -58,6 +58,23 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
       console.error('[webmunk-history] Failed to initialize list database:', error)
     }
 
+    // React to configuration updates (e.g., after identifier is set and remote config is fetched).
+    // This ensures periodic collection turns on once history config becomes available.
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local') return
+      if (changes.webmunkConfiguration || changes.webmunkHistoryConfiguration) {
+        this.loadConfiguration()
+          .then(async () => {
+            if (this.config) {
+              await this.setupAlarm()
+            }
+          })
+          .catch((err) => {
+            console.error('[webmunk-history] Failed to react to configuration change:', err)
+          })
+      }
+    })
+
     // Load configuration
     await this.loadConfiguration()
 
@@ -248,10 +265,21 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           // Only process visits after lastFetch
           if (!visit.visitTime || visit.visitTime <= lastFetch) continue
 
-          // Filter against privacy lists
-          if (await this.shouldFilterUrl(item.url)) {
+          // Basic privacy filter: only process http(s) URLs (and skip everything else like file://).
+          if (this.shouldSkipUrl(item.url)) {
             continue
           }
+
+          // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
+          const {
+            recordedUrl,
+            filteredByList,
+            filterMatch
+          } = await this.applyFilterLists(item.url, {
+            visit_id: visit.visitId,
+            visit_time: visit.visitTime,
+            history_item_id: item.id
+          })
 
           // Categorize against category lists
           const categories = await this.categorizeUrl(item.url)
@@ -260,7 +288,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           console.log('[webmunk-history] Logging event: webmunk-history-visit')
           dispatchEvent({
             name: 'webmunk-history-visit',
-            url: item.url,
+            // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
+            url: recordedUrl,
+          recorded_url: recordedUrl,
             title: item.title || '',
             visit_time: visit.visitTime,
             transition: visit.transition,
@@ -275,7 +305,20 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             history_item_id: item.id,
             last_visit_time: item.lastVisitTime,
             visit_count: item.visitCount,
-            typed_count: item.typedCount
+            typed_count: item.typedCount,
+
+            // Filter-list context (safe: doesn't include original URL)
+          filtered: Boolean(filteredByList),
+          filtered_by_list: filteredByList,
+            filtered_by_list_entry: filterMatch
+              ? {
+                  list_name: filteredByList,
+                  matched_pattern: filterMatch.domain,
+                  matched_pattern_type: filterMatch.pattern_type,
+                  matched_source: filterMatch.source,
+                  matched_metadata: filterMatch.metadata || {}
+                }
+              : undefined
           })
 
           collectedCount++
@@ -304,34 +347,48 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     }
   }
 
-  async shouldFilterUrl(url: string): Promise<boolean> {
-    if (!this.config) return true
+  /**
+   * Privacy baseline: skip URLs we should never collect/upload at all.
+   * (Filter lists are handled separately and do NOT skip; they replace recorded URL.)
+   */
+  private shouldSkipUrl(url: string): boolean {
+    // Only allow http(s) by default (privacy).
+    return !(url.startsWith('http://') || url.startsWith('https://'))
+  }
 
-    // Filter non-http(s) URLs
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      return true
+  /**
+   * Apply configured filter lists to a URL.
+   *
+   * If a match is found, we replace the recorded URL with `CATEGORY:<category|null>` so the visit
+   * can still be uploaded without the full URL. The original URL can still be inspected via the
+   * dev-only debug event (guarded by manifest name + storage flag).
+   */
+  private async applyFilterLists(
+    url: string,
+    ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
+  ): Promise<{ recordedUrl: string; filteredByList?: string; filterMatch?: listUtils.ListEntry }> {
+    if (!this.config) {
+      return { recordedUrl: url }
     }
 
-    // Filter chrome:// and extension:// URLs
-    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://')) {
-      return true
-    }
-
-    // Check against configured filter lists
     for (const listName of this.config.filter_lists) {
       try {
         const match = await listUtils.matchDomainAgainstList(url, listName)
         if (match) {
-          console.log(`[webmunk-history] Filtered URL ${url} by list ${listName}`)
-          await this.maybeLogFilteredUrlDebug(url, listName, match)
-          return true
+          const category = (match.metadata?.category as string | undefined) ?? null
+          const recordedUrl = `CATEGORY:${category ?? 'null'}`
+
+          console.log(`[webmunk-history] Filtered URL by list ${listName} -> ${recordedUrl}`)
+
+          await this.maybeLogFilteredUrlDebug(url, recordedUrl, listName, match, ctx)
+          return { recordedUrl, filteredByList: listName, filterMatch: match }
         }
       } catch (error) {
         console.error(`[webmunk-history] Error checking filter list ${listName}:`, error)
       }
     }
 
-    return false
+    return { recordedUrl: url }
   }
 
   private isDevExtension(): boolean {
@@ -342,7 +399,13 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     }
   }
 
-  private async maybeLogFilteredUrlDebug(url: string, listName: string, match: listUtils.ListEntry): Promise<void> {
+  private async maybeLogFilteredUrlDebug(
+    url: string,
+    recordedUrl: string,
+    listName: string,
+    match: listUtils.ListEntry,
+    ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
+  ): Promise<void> {
     // Hard safety gate: never allow full-URL debug logging outside the dev extension.
     const { [HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY]: enabled } =
       await chrome.storage.local.get(HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY)
@@ -361,11 +424,15 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     dispatchEvent({
       name: 'webmunk-history-filtered-url-debug',
       url,
+      recorded_url: recordedUrl,
       filtered_by_list: listName,
       matched_pattern: match.domain,
       matched_pattern_type: match.pattern_type,
       matched_source: match.source,
       matched_metadata: match.metadata || {},
+      visit_id: ctx.visit_id,
+      visit_time: ctx.visit_time,
+      history_item_id: ctx.history_item_id,
       date: Date.now()
     })
   }
