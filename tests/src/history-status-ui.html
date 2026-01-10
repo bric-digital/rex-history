@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>History Status UI Test Page</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .status-section {
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status-item {
+            margin: 10px 0;
+        }
+        .status-label {
+            font-weight: bold;
+            color: #555;
+        }
+        .status-value {
+            color: #333;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        #test-status {
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+            background-color: #d4edda;
+            border-left: 4px solid #28a745;
+            color: #155724;
+        }
+    </style>
+</head>
+<body>
+    <h1>🧪 History Status UI Test Page</h1>
+    <div id="test-status">✅ Test environment loaded and ready</div>
+
+    <div class="status-section">
+        <h2>Collection Status</h2>
+        <div class="status-item">
+            <span class="status-label">Last Collection:</span>
+            <span id="history-last-collection" class="status-value">Never</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Items Collected:</span>
+            <span id="history-items-collected" class="status-value">0</span>
+        </div>
+        <div class="status-item">
+            <button id="history-trigger-collection">Collect Now</button>
+            <button id="history-refresh-status">Refresh Status</button>
+        </div>
+    </div>
+
+    <div class="status-section">
+        <h2>Configuration</h2>
+        <div class="status-item">
+            <span class="status-label">Collection Interval:</span>
+            <span id="history-config-interval" class="status-value">N/A</span> minutes
+        </div>
+        <div class="status-item">
+            <span class="status-label">Lookback Days:</span>
+            <span id="history-config-lookback" class="status-value">N/A</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Filter Lists:</span>
+            <span id="history-config-filter-lists" class="status-value">None</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Category Lists:</span>
+            <span id="history-config-category-lists" class="status-value">None</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Generate Top Domains:</span>
+            <span id="history-config-top-domains" class="status-value">No</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Top Domains Count:</span>
+            <span id="history-config-top-domains-count" class="status-value">N/A</span>
+        </div>
+    </div>
+
+    <script type="module">
+        // Create mock Chrome APIs for testing
+        window.chrome = {
+            runtime: {
+                getManifest: () => ({ name: 'Webmunk Dev Extension' }),
+                sendMessage: async (message) => {
+                    if (message.messageType === 'getHistoryStatus') {
+                        const result = await window.chrome.storage.local.get('webmunkHistoryStatus');
+                        return result.webmunkHistoryStatus || {
+                            lastCollectionTime: undefined,
+                            itemsCollected: 0,
+                            isCollecting: false
+                        };
+                    }
+                    if (message.messageType === 'triggerHistoryCollection') {
+                        return { success: true };
+                    }
+                    if (message.messageType === 'fetchConfiguration') {
+                        return window.mockConfigResponse || {};
+                    }
+                    return { success: true };
+                }
+            },
+            storage: {
+                local: {
+                    _data: {},
+                    get: async (keys) => {
+                        if (typeof keys === 'string') {
+                            return { [keys]: window.chrome.storage.local._data[keys] };
+                        }
+                        if (Array.isArray(keys)) {
+                            const result = {};
+                            keys.forEach(key => {
+                                if (window.chrome.storage.local._data[key] !== undefined) {
+                                    result[key] = window.chrome.storage.local._data[key];
+                                }
+                            });
+                            return result;
+                        }
+                        return { ...window.chrome.storage.local._data };
+                    },
+                    set: async (items) => {
+                        Object.assign(window.chrome.storage.local._data, items);
+                    },
+                    remove: async (keys) => {
+                        const keysArray = Array.isArray(keys) ? keys : [keys];
+                        keysArray.forEach(key => {
+                            delete window.chrome.storage.local._data[key];
+                        });
+                    },
+                    clear: async () => {
+                        window.chrome.storage.local._data = {};
+                    }
+                }
+            }
+        };
+
+        // Helper function to clear storage
+        window.clearStorage = async () => {
+            await window.chrome.storage.local.clear();
+        };
+
+        // Implement the UI refresh logic (mimics extension.mts behavior)
+        window.refreshHistoryStatus = async () => {
+            try {
+                const status = await window.chrome.runtime.sendMessage({
+                    messageType: 'getHistoryStatus'
+                });
+
+                if (status.lastCollectionTime) {
+                    const lastCollectionDate = new Date(status.lastCollectionTime);
+                    document.getElementById('history-last-collection').textContent = lastCollectionDate.toLocaleString();
+                } else {
+                    document.getElementById('history-last-collection').textContent = 'Never';
+                }
+
+                document.getElementById('history-items-collected').textContent = status.itemsCollected?.toString() || '0';
+
+                if (status.isCollecting) {
+                    document.getElementById('history-trigger-collection').disabled = true;
+                    document.getElementById('history-trigger-collection').textContent = 'Collecting...';
+                } else {
+                    document.getElementById('history-trigger-collection').disabled = false;
+                    document.getElementById('history-trigger-collection').textContent = 'Collect Now';
+                }
+            } catch (error) {
+                console.error('Failed to fetch history status:', error);
+                document.getElementById('history-last-collection').textContent = 'Error';
+                document.getElementById('history-items-collected').textContent = 'Error';
+            }
+        };
+
+        // Implement the configuration loading logic
+        window.loadHistoryConfiguration = async () => {
+            try {
+                const response = await window.chrome.runtime.sendMessage({
+                    messageType: 'fetchConfiguration'
+                });
+
+                const config = response['history'];
+
+                if (config) {
+                    document.getElementById('history-config-interval').textContent = config.collection_interval_minutes?.toString() || 'N/A';
+                    document.getElementById('history-config-lookback').textContent = config.lookback_days?.toString() || 'N/A';
+                    document.getElementById('history-config-filter-lists').textContent = config.filter_lists?.join(', ') || 'None';
+                    document.getElementById('history-config-category-lists').textContent = config.category_lists?.join(', ') || 'None';
+                    document.getElementById('history-config-top-domains').textContent = config.generate_top_domains ? 'Yes' : 'No';
+                    document.getElementById('history-config-top-domains-count').textContent = config.top_domains_count?.toString() || 'N/A';
+                }
+            } catch (error) {
+                console.error('Failed to load configuration:', error);
+            }
+        };
+
+        // Set up button handlers
+        document.getElementById('history-trigger-collection').addEventListener('click', async () => {
+            const button = document.getElementById('history-trigger-collection');
+            button.disabled = true;
+            button.textContent = 'Collecting...';
+
+            try {
+                await window.chrome.runtime.sendMessage({
+                    messageType: 'triggerHistoryCollection'
+                });
+                button.disabled = false;
+                button.textContent = 'Collect Now';
+                await window.refreshHistoryStatus();
+            } catch (error) {
+                console.error('Failed to trigger history collection:', error);
+                button.disabled = false;
+                button.textContent = 'Collect Now';
+                alert('Failed to trigger history collection');
+            }
+        });
+
+        document.getElementById('history-refresh-status').addEventListener('click', () => {
+            window.refreshHistoryStatus();
+        });
+
+        // Load initial status
+        window.refreshHistoryStatus();
+
+        // Set ready flag
+        window.testUtilitiesReady = true;
+    </script>
+</body>
+</html>

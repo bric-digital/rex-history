@@ -229,6 +229,17 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     // Re-load configuration so server updates / local overrides are reflected at collection time
     await this.loadConfiguration()
 
+    // In some environments (e.g., integration tests), the extension UI may write the initial
+    // `webmunkConfiguration` slightly after the service worker starts. For manual collection,
+    // do a short bounded retry so a user click doesn't silently no-op due to a race.
+    if (!this.config) {
+      const deadlineMs = Date.now() + 1500
+      while (!this.config && Date.now() < deadlineMs) {
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        await this.loadConfiguration()
+      }
+    }
+
     if (!this.config) {
       console.warn('[webmunk-history] No configuration available, skipping collection')
       return
@@ -340,6 +351,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
     } catch (error) {
       console.error('[webmunk-history] Collection error:', error)
+      // Even on failure, record that we attempted a fetch so operators/tests can
+      // see activity and avoid "undefined" last-fetch state.
+      await this.setLastFetchTime(Date.now())
     } finally {
       this.status.isCollecting = false
       await this.saveStatus()

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webmunk History Test Page</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        #status {
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+            background-color: #d1ecf1;
+            border-left: 4px solid #17a2b8;
+            color: #0c5460;
+        }
+        .ready {
+            background-color: #d4edda;
+            border-left-color: #28a745;
+            color: #155724;
+        }
+    </style>
+</head>
+<body>
+    <h1>🧪 Webmunk History Test Page</h1>
+    <div id="status">Loading test utilities...</div>
+
+    <script type="module">
+        // Create mock Chrome APIs for testing
+        window.chrome = {
+            runtime: {
+                getManifest: () => ({ name: 'Webmunk Dev Extension' }),
+                sendMessage: async (message) => {
+                    // Mock message handling
+                    return { success: true };
+                },
+                onMessage: {
+                    addListener: (callback) => {
+                        window.__chromeMessageListeners = window.__chromeMessageListeners || [];
+                        window.__chromeMessageListeners.push(callback);
+                    }
+                }
+            },
+            storage: {
+                local: {
+                    _data: {},
+                    get: async (keys) => {
+                        if (typeof keys === 'string') {
+                            return { [keys]: window.chrome.storage.local._data[keys] };
+                        }
+                        if (Array.isArray(keys)) {
+                            const result = {};
+                            keys.forEach(key => {
+                                if (window.chrome.storage.local._data[key] !== undefined) {
+                                    result[key] = window.chrome.storage.local._data[key];
+                                }
+                            });
+                            return result;
+                        }
+                        return { ...window.chrome.storage.local._data };
+                    },
+                    set: async (items) => {
+                        Object.assign(window.chrome.storage.local._data, items);
+                        // Trigger onChanged listeners
+                        if (window.chrome.storage.onChanged._listeners.length > 0) {
+                            const changes = {};
+                            Object.keys(items).forEach(key => {
+                                changes[key] = {
+                                    newValue: items[key],
+                                    oldValue: undefined
+                                };
+                            });
+                            window.chrome.storage.onChanged._listeners.forEach(listener => {
+                                listener(changes, 'local');
+                            });
+                        }
+                    },
+                    remove: async (keys) => {
+                        const keysArray = Array.isArray(keys) ? keys : [keys];
+                        keysArray.forEach(key => {
+                            delete window.chrome.storage.local._data[key];
+                        });
+                    },
+                    clear: async () => {
+                        window.chrome.storage.local._data = {};
+                    }
+                },
+                onChanged: {
+                    _listeners: [],
+                    addListener: (callback) => {
+                        window.chrome.storage.onChanged._listeners.push(callback);
+                    }
+                }
+            },
+            history: {
+                _items: [],
+                search: async ({ text, startTime, maxResults }) => {
+                    return window.chrome.history._items.filter(item => {
+                        if (startTime && item.lastVisitTime < startTime) return false;
+                        if (text && !item.url.includes(text) && !item.title?.includes(text)) return false;
+                        return true;
+                    }).slice(0, maxResults || 100);
+                },
+                getVisits: async ({ url }) => {
+                    const item = window.chrome.history._items.find(i => i.url === url);
+                    if (!item) return [];
+                    return item._visits || [];
+                }
+            },
+            alarms: {
+                _alarms: {},
+                _listeners: [],
+                create: async (name, alarmInfo) => {
+                    window.chrome.alarms._alarms[name] = alarmInfo;
+                },
+                clear: async (name) => {
+                    delete window.chrome.alarms._alarms[name];
+                },
+                get: async (name) => {
+                    return window.chrome.alarms._alarms[name];
+                },
+                getAll: async () => {
+                    return Object.keys(window.chrome.alarms._alarms).map(name => ({
+                        name,
+                        ...window.chrome.alarms._alarms[name]
+                    }));
+                },
+                onAlarm: {
+                    addListener: (callback) => {
+                        window.chrome.alarms._listeners.push(callback);
+                    }
+                }
+            }
+        };
+
+        // Helper function to add mock history items
+        window.addMockHistoryItem = (item) => {
+            window.chrome.history._items.push(item);
+        };
+
+        // Helper function to clear mock history
+        window.clearMockHistory = () => {
+            window.chrome.history._items = [];
+        };
+
+        // Helper function to clear storage
+        window.clearStorage = async () => {
+            await window.chrome.storage.local.clear();
+        };
+
+        // Helper function to trigger alarm
+        window.triggerAlarm = (name) => {
+            window.chrome.alarms._listeners.forEach(listener => {
+                listener({ name });
+            });
+        };
+
+        // Set ready status
+        document.getElementById('status').textContent = '✅ Test environment loaded and ready';
+        document.getElementById('status').className = 'ready';
+
+        // Set a flag that Playwright can check
+        window.testUtilitiesReady = true;
+    </script>
+</body>
+</html>
