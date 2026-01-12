@@ -6,6 +6,7 @@ interface HistoryConfig {
   collection_interval_minutes: number;
   lookback_days: number;
   filter_lists: string[];
+  allow_lists: string[];
   category_lists: string[];
   generate_top_domains: boolean;
   top_domains_count: number;
@@ -281,16 +282,46 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             continue
           }
 
-          // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
-          const {
-            recordedUrl,
-            filteredByList,
-            filterMatch
-          } = await this.applyFilterLists(item.url, {
-            visit_id: visit.visitId,
-            visit_time: visit.visitTime,
-            history_item_id: item.id
-          })
+          // Apply allow_lists: if configured, only collect URLs matching an allow-list.
+          // If not allowed, create a dummy record (like blocklist behavior).
+          const allowCheck = await this.checkAllowLists(item.url)
+          let recordedUrl = item.url
+          let recordedTitle = item.title || ''
+          let filteredByList: string | undefined
+          let filterMatch: listUtils.ListEntry | undefined
+          
+          if (!allowCheck.allowed) {
+            // URL not on allowlist - create dummy record with category placeholder
+            recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
+            recordedTitle = recordedUrl
+            // Log debug event if enabled (dev-only)
+            await this.maybeLogFilteredUrlDebug(
+              item.url, 
+              recordedUrl, 
+              'NOT_ON_ALLOWLIST',
+              undefined,
+              {
+                visit_id: visit.visitId,
+                visit_time: visit.visitTime,
+                history_item_id: item.id
+              }
+            )
+          } else {
+            // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
+            const filterResult = await this.applyFilterLists(item.url, {
+              visit_id: visit.visitId,
+              visit_time: visit.visitTime,
+              history_item_id: item.id
+            })
+            recordedUrl = filterResult.recordedUrl
+            filteredByList = filterResult.filteredByList
+            filterMatch = filterResult.filterMatch
+
+            // Privacy: if we masked the URL, mask the title too.
+            if (recordedUrl.startsWith('CATEGORY:')) {
+              recordedTitle = recordedUrl
+            }
+          }
 
           // Categorize against category lists
           const categories = await this.categorizeUrl(item.url)
@@ -301,8 +332,8 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             name: 'webmunk-history-visit',
             // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
             url: recordedUrl,
-          recorded_url: recordedUrl,
-            title: item.title || '',
+            recorded_url: recordedUrl,
+            title: recordedTitle,
             visit_time: visit.visitTime,
             transition: visit.transition,
             categories: categories,
@@ -318,9 +349,21 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             visit_count: item.visitCount,
             typed_count: item.typedCount,
 
+            // Allow-list context (which list allowed this URL)
+            allowed_by_list: allowCheck.matchedList,
+            allowed_by_list_entry: allowCheck.matchEntry
+              ? {
+                  list_name: allowCheck.matchedList,
+                  matched_pattern: allowCheck.matchEntry.domain,
+                  matched_pattern_type: allowCheck.matchEntry.pattern_type,
+                  matched_source: allowCheck.matchEntry.source,
+                  matched_metadata: allowCheck.matchEntry.metadata || {}
+                }
+              : undefined,
+
             // Filter-list context (safe: doesn't include original URL)
-          filtered: Boolean(filteredByList),
-          filtered_by_list: filteredByList,
+            filtered: Boolean(filteredByList),
+            filtered_by_list: filteredByList,
             filtered_by_list_entry: filterMatch
               ? {
                   list_name: filteredByList,
@@ -371,6 +414,47 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
   }
 
   /**
+   * Check if URL is allowed by the allow_lists.
+   *
+   * If allow_lists is configured and non-empty, only URLs matching at least one
+   * allow-list entry will be collected. URLs not on an allow-list are skipped entirely.
+   *
+   * Returns { allowed: true, matchedList, matchEntry } if allowed, or { allowed: false } if not.
+   */
+  private async checkAllowLists(url: string): Promise<{
+    allowed: boolean;
+    matchedList?: string;
+    matchEntry?: listUtils.ListEntry;
+  }> {
+    if (!this.config) {
+      return { allowed: true }
+    }
+
+    const allowLists = this.config.allow_lists
+    if (!allowLists || allowLists.length === 0) {
+      // No allow-lists configured = allow everything (default behavior)
+      return { allowed: true }
+    }
+
+    // Check each allow-list for a match
+    for (const listName of allowLists) {
+      try {
+        const match = await listUtils.matchDomainAgainstList(url, listName)
+        if (match) {
+          console.log(`[webmunk-history] URL allowed by list ${listName}: ${url}`)
+          return { allowed: true, matchedList: listName, matchEntry: match }
+        }
+      } catch (error) {
+        console.error(`[webmunk-history] Error checking allow list ${listName}:`, error)
+      }
+    }
+
+    // No match found in any allow-list = skip this URL
+    console.log(`[webmunk-history] URL not in allow-lists, skipping: ${url}`)
+    return { allowed: false }
+  }
+
+  /**
    * Apply configured filter lists to a URL.
    *
    * If a match is found, we replace the recorded URL with `CATEGORY:<category|null>` so the visit
@@ -417,7 +501,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     url: string,
     recordedUrl: string,
     listName: string,
-    match: listUtils.ListEntry,
+    match: listUtils.ListEntry | undefined,
     ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
   ): Promise<void> {
     // Hard safety gate: never allow full-URL debug logging outside the dev extension.
@@ -439,11 +523,12 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
       name: 'webmunk-history-filtered-url-debug',
       url,
       recorded_url: recordedUrl,
-      filtered_by_list: listName,
-      matched_pattern: match.domain,
-      matched_pattern_type: match.pattern_type,
-      matched_source: match.source,
-      matched_metadata: match.metadata || {},
+      filtered_by_list: listName === 'NOT_ON_ALLOWLIST' ? undefined : listName,
+      allowed_by_list: listName === 'NOT_ON_ALLOWLIST' ? 'NOT_ON_ALLOWLIST' : undefined,
+      matched_pattern: match?.domain,
+      matched_pattern_type: match?.pattern_type,
+      matched_source: match?.source,
+      matched_metadata: match?.metadata || {},
       visit_id: ctx.visit_id,
       visit_time: ctx.visit_time,
       history_item_id: ctx.history_item_id,

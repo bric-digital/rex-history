@@ -90,8 +90,12 @@
             <span id="history-config-lookback" class="status-value">N/A</span>
         </div>
         <div class="status-item">
-            <span class="status-label">Filter Lists:</span>
+            <span class="status-label">Filter Lists (blocklist):</span>
             <span id="history-config-filter-lists" class="status-value">None</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Allow Lists:</span>
+            <span id="history-config-allow-lists" class="status-value">None (all URLs allowed)</span>
         </div>
         <div class="status-item">
             <span class="status-label">Category Lists:</span>
@@ -211,7 +215,8 @@
                 if (config) {
                     document.getElementById('history-config-interval').textContent = config.collection_interval_minutes?.toString() || 'N/A';
                     document.getElementById('history-config-lookback').textContent = config.lookback_days?.toString() || 'N/A';
-                    document.getElementById('history-config-filter-lists').textContent = config.filter_lists?.join(', ') || 'None';
+                    document.getElementById('history-config-filter-lists').textContent = config.filter_lists?.length ? config.filter_lists.join(', ') : 'None';
+                    document.getElementById('history-config-allow-lists').textContent = config.allow_lists?.length ? config.allow_lists.join(', ') : 'None (all URLs allowed)';
                     document.getElementById('history-config-category-lists').textContent = config.category_lists?.join(', ') || 'None';
                     document.getElementById('history-config-top-domains').textContent = config.generate_top_domains ? 'Yes' : 'No';
                     document.getElementById('history-config-top-domains-count').textContent = config.top_domains_count?.toString() || 'N/A';
