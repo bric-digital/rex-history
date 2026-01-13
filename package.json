@@ -48,7 +48,8 @@
         "typescript-eslint": "^8.46.3"
     },
     "dependencies": {
-        "@bric/webmunk-core": "file:../webmunk-core",
+        "@bric/webmunk-core": "github:bric-digital/webmunk-core#main",
+        "@bric/webmunk-lists": "github:bric-digital/webmunk-lists#main",
         "jquery": "^3.7.1",
         "psl": "^1.9.0"
     }

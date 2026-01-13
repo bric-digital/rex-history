@@ -1,6 +1,6 @@
 import psl from 'psl'
 import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/webmunk-core/service-worker'
-import * as listUtils from '@bric/webmunk-core/list-utilities'
+import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
   collection_interval_minutes: number;
