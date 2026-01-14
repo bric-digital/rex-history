@@ -96,9 +96,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     })
 
     // Set up message listener
-    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      return this.handleMessage(message, sender, sendResponse)
-    })
+    // chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    //   return this.handleMessage(message, sender, sendResponse)
+    // })
 
     // Load status from storage
     await this.loadStatus()
@@ -289,15 +289,15 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           let recordedTitle = item.title || ''
           let filteredByList: string | undefined
           let filterMatch: listUtils.ListEntry | undefined
-          
+
           if (!allowCheck.allowed) {
             // URL not on allowlist - create dummy record with category placeholder
             recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
             recordedTitle = recordedUrl
             // Log debug event if enabled (dev-only)
             await this.maybeLogFilteredUrlDebug(
-              item.url, 
-              recordedUrl, 
+              item.url,
+              recordedUrl,
               'NOT_ON_ALLOWLIST',
               undefined,
               {
@@ -635,7 +635,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     if (message.messageType === 'getHistoryStatus') {
       console.log('[webmunk-history] Sending status:', this.status)
       sendResponse(this.status)
-      return false
+      return true
     }
 
     console.log('[webmunk-history] Unknown message type, not handling')
