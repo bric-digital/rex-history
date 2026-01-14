@@ -240,6 +240,9 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
         await this.loadConfiguration()
       }
     }
+    // CK NOTE ^^^^^ may be mnore cleanly expressed with a simple setTimeout call that recursively calls
+    // collectHistory after a delay. That will also catch any cases where you're waiting more than
+    // deadlineMs for the configuration to show up.
 
     if (!this.config) {
       console.warn('[webmunk-history] No configuration available, skipping collection')
@@ -388,6 +391,19 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
       // Update status
       this.status.lastCollectionTime = Date.now()
+      // CK NOTE ^^^^^ Instead of using Date.now() here, we should probably capture a
+      // Date.now() at the beginning of this function, and use that here IF the data
+      // collection is successful. Using the timestamp here creates a window for visits
+      // to be missed that occur while this function is running before this point.
+      //
+      // Also, we shoudl check that the number of results is less than 10K. If more than
+      // 10K, there are visits we are not getting and lastCollectionTime should be the
+      // timestamp of the last visit in that bundle, so we can pick up where we left off
+      // on the next run.
+      //
+      // Also, if num of results is 10K, we can call this function again (and again) until
+      // we are sure that we have everything.
+
       this.status.itemsCollected += collectedCount
       await this.setLastFetchTime(Date.now())
       await this.saveStatus()
@@ -453,6 +469,66 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     console.log(`[webmunk-history] URL not in allow-lists, skipping: ${url}`)
     return { allowed: false }
   }
+
+  /**
+   * Example of what the function above looks like using a promise...
+   * More explicit - not sure if an improvement...
+   */
+  private async checkAllowListsUsingPromise(url: string): Promise<{
+    allowed: boolean;
+    matchedList?: string;
+    matchEntry?: listUtils.ListEntry;
+  }> {
+    return new Promise((resolve, reject) => {
+      if (!this.config) {
+        resolve({ allowed: true })
+      } else {
+        const allowLists = this.config.allow_lists
+
+        if (!allowLists || allowLists.length === 0) {
+          // No allow-lists configured = allow everything (default behavior)
+          resolve({ allowed: true })
+        } else {
+          let toCheck = []
+
+          toCheck.push(...allowLists) // Using toCheck as a stack to replace the for loop.
+
+          const checkListItem = (url: string, listName:string|undefined) => { // recursive function replacing for loop
+            if (listName == undefined) {
+              if (toCheck.length == 0) {
+                console.log(`[webmunk-history] URL not in allow-lists, skipping: ${url}`)
+                resolve({ allowed: false })
+              } else {
+                checkListItem(url, toCheck.pop())
+              }
+            } else {
+              listUtils.matchDomainAgainstList(url, listName)
+                .then((match) => { // CK TODO: Import and add ListEntry type to match declaration
+                  if (match) {
+                    console.log(`[webmunk-history] URL allowed by list ${listName}: ${url}`)
+
+                    resolve({ allowed: true, matchedList: listName, matchEntry: match })
+                  } else {
+                    checkListItem(url, toCheck.pop())
+                  }
+                })
+                .catch((error) => {
+                  console.error(`[webmunk-history] Error checking allow list ${listName}:`, error)
+                  // If abort on first error, exit using reject:
+                  // reject(error)
+                  // else continue on...
+
+                  checkListItem(url, toCheck.pop())
+                })
+            }
+          }
+
+          checkListItem(url, toCheck.pop())
+        }
+      }
+    })
+  }
+
 
   /**
    * Apply configured filter lists to a URL.
