@@ -282,6 +282,19 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             continue
           }
 
+          // Extract registered domain from URL using psl
+          let registeredDomain = 'not available'
+          try {
+            const urlObj = new URL(item.url)
+            const hostname = urlObj.hostname
+            const parsed = psl.parse(hostname)
+            if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
+              registeredDomain = parsed.domain
+            }
+          } catch {
+            // Keep default 'not available' for invalid URLs
+          }
+
           // Apply allow_lists: if configured, only collect URLs matching an allow-list.
           // If not allowed, create a dummy record (like blocklist behavior).
           const allowCheck = await this.checkAllowLists(item.url)
@@ -293,7 +306,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           if (!allowCheck.allowed) {
             // URL not on allowlist - create dummy record with category placeholder
             recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
-            recordedTitle = recordedUrl
+            recordedTitle = ''
             // Log debug event if enabled (dev-only)
             await this.maybeLogFilteredUrlDebug(
               item.url, 
@@ -319,7 +332,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
             // Privacy: if we masked the URL, mask the title too.
             if (recordedUrl.startsWith('CATEGORY:')) {
-              recordedTitle = recordedUrl
+              recordedTitle = ''
             }
           }
 
@@ -333,9 +346,11 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
             // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
             url: recordedUrl,
             recorded_url: recordedUrl,
+            domain: registeredDomain,
             title: recordedTitle,
             visit_time: visit.visitTime,
             transition: visit.transition,
+            is_local: visit.isLocal,
             categories: categories,
             date: visit.visitTime,
 
