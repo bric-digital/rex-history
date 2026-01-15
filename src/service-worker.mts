@@ -1,5 +1,5 @@
 import psl from 'psl'
-import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/webmunk-core/service-worker'
+import { WebmunkServiceWorkerModule, registerWebmunkModule, broadcastEvent } from '@bric/webmunk-core/service-worker'
 import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
@@ -341,7 +341,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
           // Dispatch event to all modules (PDK will pick it up for upload)
           console.log('[webmunk-history] Logging event: webmunk-history-visit')
-          dispatchEvent({
+          broadcastEvent({
             name: 'webmunk-history-visit',
             // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
             url: recordedUrl,
@@ -534,7 +534,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
     if (enabled !== true) return
 
     // Emit a debug event that Passive Data Kit will capture.
-    dispatchEvent({
+    broadcastEvent({
       name: 'webmunk-history-filtered-url-debug',
       url,
       recorded_url: recordedUrl,
