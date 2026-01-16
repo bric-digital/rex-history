@@ -289,7 +289,8 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
           // If not allowed, create a dummy record (like blocklist behavior).
           const allowCheck = await this.checkAllowLists(item.url)
 
-          console.log(`[webmunk-history] this.checkAllowLists(${item.url}) = ${allowCheck}`)
+          console.log(`[webmunk-history] this.checkAllowLists(${item.url}):`)
+          console.log(allowCheck)
 
           let recordedUrl = item.url
           let recordedTitle = item.title || ''
@@ -457,6 +458,7 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
     // Check each allow-list for a match
     for (const listName of allowLists) {
+      console.log(`checkAllowLists(${url}), checking if in ${listName}`)
       try {
         const match = await listUtils.matchDomainAgainstList(url, listName)
         if (match) {
