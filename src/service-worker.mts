@@ -151,6 +151,15 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
         await this.saveStatus()
         console.warn('[webmunk-history] No history configuration found (neither override nor server config)')
       }
+
+      if (baseConfig['lists'] !== undefined) {
+        listUtils.parseAndSyncLists(baseConfig['lists'])
+        .then(() => {
+          console.log('[webmunk-history] Lists synced.')
+          console.log(baseConfig['lists'])
+        })
+      }
+
     } catch (error) {
       console.error('[webmunk-history] Failed to load configuration:', error)
     }
