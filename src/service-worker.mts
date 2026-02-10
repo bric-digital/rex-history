@@ -152,7 +152,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         console.warn('[webmunk-history] No history configuration found (neither override nor server config)')
       }
 
-      if (baseConfig['lists'] !== undefined) {
+      if (baseConfig !== undefined && baseConfig['lists'] !== undefined) {
         listUtils.parseAndSyncLists(baseConfig['lists'])
         .then(() => {
           console.log('[webmunk-history] Lists synced.')
