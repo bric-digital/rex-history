@@ -1,5 +1,5 @@
 import psl from 'psl'
-import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/webmunk-core/service-worker'
+import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/rex-core/service-worker'
 import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
