@@ -1,5 +1,5 @@
 import psl from 'psl'
-import { WebmunkServiceWorkerModule, registerWebmunkModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
 import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
@@ -24,7 +24,7 @@ interface HistoryStatus {
 /**
  * History collection module - collects browser history with filtering and categorization
  */
-class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
+class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   config: HistoryConfig | null = null
   status: HistoryStatus = {
     itemsCollected: 0,
@@ -754,6 +754,6 @@ class HistoryServiceWorkerModule extends WebmunkServiceWorkerModule {
 
 const plugin = new HistoryServiceWorkerModule()
 
-registerWebmunkModule(plugin)
+registerREXModule(plugin)
 
 export default plugin
