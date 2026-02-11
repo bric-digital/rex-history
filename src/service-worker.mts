@@ -1,5 +1,5 @@
 import psl from 'psl'
-import { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexCorePlugin, { REXServiceWorkerModule, REXConfiguration, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
 import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
@@ -105,6 +105,28 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
     // Ensure status reflects current effective configuration + source
     await this.loadConfiguration()
+  }
+
+  refreshConfiguration() {
+    rexCorePlugin.fetchConfiguration()
+      .then((configuration:REXConfiguration) => {
+        if (configuration !== undefined) {
+          const historyConfig = configuration['history']
+
+          if (historyConfig !== undefined) {
+            this.updateConfiguration(historyConfig)
+          }
+        }
+      })
+  }
+
+  updateConfiguration(config) {
+    console.log('[history] updateConfiguration')
+    console.log(config)
+
+    chrome.storage.local.set({
+      'webmunkHistoryConfiguration': config
+    })
   }
 
   async loadConfiguration() {
