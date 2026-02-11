@@ -1,5 +1,6 @@
 import psl from 'psl'
-import rexCorePlugin, { REXServiceWorkerModule, REXConfiguration, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import { type REXConfiguration } from '@bric/rex-core/extension'
 import * as listUtils from '@bric/webmunk-lists'
 
 interface HistoryConfig {
