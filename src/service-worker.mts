@@ -236,8 +236,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return
     }
 
+    console.log('[history] loading config')
+
     // Re-load configuration so server updates / local overrides are reflected at collection time
     await this.loadConfiguration()
+
+    console.log('[history] loaded config')
 
     // In some environments (e.g., integration tests), the extension UI may write the initial
     // `webmunkConfiguration` slightly after the service worker starts. For manual collection,
@@ -249,9 +253,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         await this.loadConfiguration()
       }
     }
-    // CK NOTE ^^^^^ may be mnore cleanly expressed with a simple setTimeout call that recursively calls
+    // CK NOTE ^^^^^ may be more cleanly expressed with a simple setTimeout call that recursively calls
     // collectHistory after a delay. That will also catch any cases where you're waiting more than
     // deadlineMs for the configuration to show up.
+
+    console.log(`[history] config: ${this.config}`)
 
     if (!this.config) {
       console.warn('[webmunk-history] No configuration available, skipping collection')
