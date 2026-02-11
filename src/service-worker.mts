@@ -140,6 +140,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       const overrideResult = await chrome.storage.local.get('webmunkHistoryConfiguration')
       const overrideConfig = overrideResult.webmunkHistoryConfiguration as { history?: HistoryConfig } | undefined
 
+      console.log('overrideConfig')
+      console.log(overrideConfig)
+
       const baseHistory = baseConfig?.history
       const overrideHistory = overrideConfig?.history
 
@@ -156,6 +159,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         effectiveHistory = baseHistory
         source = 'server'
       }
+
+      console.log('effectiveHistory')
+      console.log(effectiveHistory)
 
       if (effectiveHistory) {
         this.config = effectiveHistory
