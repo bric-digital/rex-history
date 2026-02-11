@@ -126,7 +126,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     console.log(config)
 
     chrome.storage.local.set({
-      'webmunkHistoryConfiguration': config
+      'webmunkHistoryConfiguration': {
+        'history': config
+      }
     })
   }
 
