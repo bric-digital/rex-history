@@ -808,6 +808,44 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return true
     }
 
+    if (message.messageType === 'getOldestHistoryAge') {
+      console.log('[webmunk-history] Searching for oldest history item')
+      const lookbackDays = this.config?.lookback_days ?? 30
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000
+
+      chrome.history.search({ text: '', startTime: 0, maxResults: 10000 })
+        .then((items) => {
+          if (items.length === 0) {
+            sendResponse({ ageSeconds: null })
+            return
+          }
+
+          const oldestVisitTime = items.reduce(
+            (min, item) => Math.min(min, item.lastVisitTime ?? Date.now()),
+            Date.now()
+          )
+
+          // If we received a full page and the oldest found is still under the lookback period,
+          // there may be older items beyond the 10k limit — fetch one more page.
+          if (items.length === 10000 && (Date.now() - oldestVisitTime) < lookbackMs) {
+            console.log(`[webmunk-history] First 10k items are all under ${lookbackDays} days old, fetching another page`)
+            chrome.history.search({ text: '', startTime: 0, endTime: oldestVisitTime - 1, maxResults: 10000 })
+              .then((olderItems) => {
+                const oldest = olderItems.reduce(
+                  (min, item) => Math.min(min, item.lastVisitTime ?? oldestVisitTime),
+                  oldestVisitTime
+                )
+                sendResponse({ ageSeconds: (Date.now() - oldest) / 1000 })
+              })
+              .catch(() => sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1000 }))
+          } else {
+            sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1000 })
+          }
+        })
+        .catch(() => sendResponse({ ageSeconds: null }))
+      return true
+    }
+
     console.log('[webmunk-history] Unknown message type, not handling')
     return false
   }
