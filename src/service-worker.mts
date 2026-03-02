@@ -139,7 +139,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       const configurationRecord = configuration as unknown as Record<string, unknown> | undefined
       const historyConfig = configurationRecord?.['history'] as HistoryConfig | undefined
 
-      if (historyConfig) {
+      if (historyConfig && (historyConfig as unknown as Record<string, unknown>)['enabled'] !== false) {
         this.config = historyConfig
         this.status.configSource = 'server'
         this.status.effectiveConfig = historyConfig
