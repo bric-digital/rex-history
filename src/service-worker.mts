@@ -351,7 +351,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       .then(() => {
         this.status.lastCollectionTime = Date.now()
         this.status.itemsCollected += collectedCount
-        return this.setLastFetchTime(Date.now())
+        return this.setLastFetchTime(lastProcessedVisitTime)
       })
       .then(() => this.saveStatus())
   }

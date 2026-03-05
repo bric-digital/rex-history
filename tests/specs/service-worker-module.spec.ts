@@ -517,4 +517,41 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     )
     expect(events).toHaveLength(0)
   })
+
+  test('second collection cycle captures visits added after the first cycle', async ({ page }) => {
+    // Add a history item and run the first collection cycle.
+    const t1 = Date.now() - 2000
+    await addHistoryItem(page, 'https://www.first.com', 'First', t1)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const firstCycleEvents = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit'
+        )
+    )
+    const firstUrls = firstCycleEvents.map((e) => e.url)
+    expect(firstUrls).toContain('https://www.first.com')
+
+    // Add a second history item AFTER the first cycle completed, then run a
+    // second cycle. The cursor must not have jumped past this visit.
+    const t2 = Date.now()
+    await addHistoryItem(page, 'https://www.second.com', 'Second', t2)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const secondCycleEvents = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit'
+        )
+    )
+    const secondUrls = secondCycleEvents.map((e) => e.url)
+    expect(secondUrls).toContain('https://www.second.com')
+  })
 })
