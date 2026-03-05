@@ -470,7 +470,7 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     expect(typeof event.url).toBe('string')
     expect(typeof event.domain).toBe('string')
     expect(typeof event.visit_time).toBe('number')
-    expect(typeof event.transition).toBe('string')
+    expect(typeof event.transition_type).toBe('string')
     expect(Array.isArray(event.categories)).toBe(true)
   })
 

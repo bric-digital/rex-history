@@ -470,7 +470,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           domain: registeredDomain,
           title: recordedTitle,
           visit_time: visit.visitTime,
-          transition: visit.transition,
+          transition_type: visit.transition,
           is_local: visit.isLocal,
           categories: categories,
           date: visit.visitTime,

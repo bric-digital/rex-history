@@ -17488,7 +17488,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       const configuration = await service_worker_default.fetchConfiguration();
       const configurationRecord = configuration;
       const historyConfig = configurationRecord?.["history"];
-      if (historyConfig) {
+      if (historyConfig && historyConfig["enabled"] !== false) {
         this.config = historyConfig;
         this.status.configSource = "server";
         this.status.effectiveConfig = historyConfig;
@@ -17736,7 +17736,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           domain: registeredDomain,
           title: recordedTitle,
           visit_time: visit.visitTime,
-          transition: visit.transition,
+          transition_type: visit.transition,
           is_local: visit.isLocal,
           categories,
           date: visit.visitTime,
@@ -17978,6 +17978,34 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     if (message.messageType === "getHistoryStatus") {
       console.log("[webmunk-history] Sending status:", this.status);
       sendResponse(this.status);
+      return true;
+    }
+    if (message.messageType === "getOldestHistoryAge") {
+      console.log("[webmunk-history] Searching for oldest history item");
+      const lookbackDays = this.config?.lookback_days ?? 30;
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1e3;
+      globalThis.chrome.history.search({ text: "", startTime: 0, maxResults: 1e4 }).then((items) => {
+        if (items.length === 0) {
+          sendResponse({ ageSeconds: null });
+          return;
+        }
+        const oldestVisitTime = items.reduce(
+          (min, item) => Math.min(min, item.lastVisitTime ?? Date.now()),
+          Date.now()
+        );
+        if (items.length === 1e4 && Date.now() - oldestVisitTime < lookbackMs) {
+          console.log(`[webmunk-history] First 10k items are all under ${lookbackDays} days old, fetching another page`);
+          globalThis.chrome.history.search({ text: "", startTime: 0, endTime: oldestVisitTime - 1, maxResults: 1e4 }).then((olderItems) => {
+            const oldest = olderItems.reduce(
+              (min, item) => Math.min(min, item.lastVisitTime ?? oldestVisitTime),
+              oldestVisitTime
+            );
+            sendResponse({ ageSeconds: (Date.now() - oldest) / 1e3 });
+          }).catch(() => sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 }));
+        } else {
+          sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 });
+        }
+      }).catch(() => sendResponse({ ageSeconds: null }));
       return true;
     }
     console.log("[webmunk-history] Unknown message type, not handling");
