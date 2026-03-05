@@ -27,8 +27,8 @@ async function seedConfigAndIdentifier(
   overrides: Record<string, unknown> = {}
 ) {
   await page.evaluate((overrides) => {
-    window.chrome.storage.local._data.rexIdentifier = 'test-participant-001'
-    window.chrome.storage.local._data.REXConfiguration = {
+    ;(window as any).chrome.storage.local._data.rexIdentifier = 'test-participant-001'
+    ;(window as any).chrome.storage.local._data.REXConfiguration = {
       history: {
         collection_interval_minutes: 60,
         lookback_days: 7,
@@ -53,7 +53,7 @@ async function addHistoryItem(
   visitTime: number
 ) {
   await page.evaluate(({ url, title, visitTime }) => {
-    window.chrome.history._items.push({
+    ;(window as any).chrome.history._items.push({
       id: String(Date.now() + Math.random()),
       url,
       title,
@@ -155,7 +155,7 @@ test.describe('HistoryServiceWorkerModule — Alarm Setup', () => {
   test('no alarm is created when there is no user identifier', async ({ page }) => {
     // Set config but no identifier.
     await page.evaluate(() => {
-      window.chrome.storage.local._data.REXConfiguration = {
+      ;(window as any).chrome.storage.local._data.REXConfiguration = {
         history: { collection_interval_minutes: 60, lookback_days: 7 }
       }
     })
@@ -230,7 +230,7 @@ test.describe('HistoryServiceWorkerModule — URL Filtering (shouldSkipUrl)', ()
         'ftp://example.com/file.zip'
       ]
       for (const url of skipUrls) {
-        window.chrome.history._items.push({
+        ;(window as any).chrome.history._items.push({
           id: String(Math.random()),
           url,
           title: 'Skip me',

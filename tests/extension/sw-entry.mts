@@ -9,7 +9,7 @@
  * within the service worker evaluation context.
  */
 import rexCorePlugin from '@bric/rex-core/service-worker'
-import '../../src/service-worker.mts'  // side-effect: registerREXModule(plugin) + setup()
+import '../../src/service-worker.mjs'  // side-effect: registerREXModule(plugin) + setup()
 
 // Enable message routing (the minimum subset of rexCorePlugin.setup() needed for tests).
 // This lets chrome.runtime.sendMessage calls from extension pages reach the history module.

@@ -9,7 +9,7 @@
  */
 import rexCorePlugin, { registerREXModule, REXServiceWorkerModule } from '@bric/rex-core/service-worker'
 import * as listUtils from '@bric/rex-lists'
-import historyPlugin from '../../src/service-worker.mts'
+import historyPlugin from '../../src/service-worker.mjs'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const g = globalThis as any

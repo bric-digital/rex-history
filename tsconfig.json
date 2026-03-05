@@ -4,7 +4,7 @@
     "outDir": "./dist",
     "module": "nodenext",
     "target": "esnext",
-    "types": ["chrome-types", "jquery"],
+    "types": ["chrome-types", "jquery", "node"],
     "sourceMap": true,
     "declaration": true,
     "declarationMap": true,

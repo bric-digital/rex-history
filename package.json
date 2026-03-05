@@ -39,6 +39,7 @@
         "@eslint/js": "^9.39.1",
         "@playwright/test": "^1.48.0",
         "@types/jquery": "^3.5.33",
+        "@types/node": "^25.3.3",
         "chrome-types": "^0.1.387",
         "esbuild": "^0.27.2",
         "eslint": "^9.39.1",
