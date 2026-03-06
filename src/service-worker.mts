@@ -155,13 +155,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
       const listConfig = configurationRecord?.['lists']
       if (listConfig !== null && listConfig !== undefined && typeof listConfig === 'object' && !Array.isArray(listConfig)) {
-        listUtils.parseAndSyncLists(listConfig as Parameters<typeof listUtils.parseAndSyncLists>[0])
-          .then(() => {
-            console.log('[webmunk-history] Lists synced.')
-          })
-          .catch((err: unknown) => {
-            console.error('[webmunk-history] Failed to sync lists:', err)
-          })
+        await listUtils.parseAndSyncLists(listConfig as Parameters<typeof listUtils.parseAndSyncLists>[0])
+        console.log('[webmunk-history] Lists synced.')
       }
 
     } catch (error) {

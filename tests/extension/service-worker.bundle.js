@@ -17503,11 +17503,8 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       }
       const listConfig = configurationRecord?.["lists"];
       if (listConfig !== null && listConfig !== void 0 && typeof listConfig === "object" && !Array.isArray(listConfig)) {
-        parseAndSyncLists(listConfig).then(() => {
-          console.log("[webmunk-history] Lists synced.");
-        }).catch((err) => {
-          console.error("[webmunk-history] Failed to sync lists:", err);
-        });
+        await parseAndSyncLists(listConfig);
+        console.log("[webmunk-history] Lists synced.");
       }
     } catch (error) {
       console.error("[webmunk-history] Failed to load configuration:", error);
