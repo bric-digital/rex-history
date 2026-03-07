@@ -767,7 +767,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       // Create new entries
       const entries = sortedDomains.map(([domain, count]) => ({
         list_name: this.config!.top_domains_list_name,
-        domain: domain,
+        pattern: domain,
         pattern_type: 'domain' as const,
         source: 'generated' as const,
         metadata: {
