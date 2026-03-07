@@ -485,7 +485,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           allowed_by_list_entry: allowCheck.matchEntry
             ? {
                 list_name: allowCheck.matchedList,
-                matched_pattern: allowCheck.matchEntry.domain,
+                matched_pattern: allowCheck.matchEntry.pattern,
                 matched_pattern_type: allowCheck.matchEntry.pattern_type,
                 matched_source: allowCheck.matchEntry.source,
                 matched_metadata: allowCheck.matchEntry.metadata || {}
@@ -498,7 +498,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           filtered_by_list_entry: filterMatch
             ? {
                 list_name: filteredByList,
-                matched_pattern: filterMatch.domain,
+                matched_pattern: filterMatch.pattern,
                 matched_pattern_type: filterMatch.pattern_type,
                 matched_source: filterMatch.source,
                 matched_metadata: filterMatch.metadata || {}
@@ -666,7 +666,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       recorded_url: recordedUrl,
       filtered_by_list: listName === 'NOT_ON_ALLOWLIST' ? undefined : listName,
       allowed_by_list: listName === 'NOT_ON_ALLOWLIST' ? 'NOT_ON_ALLOWLIST' : undefined,
-      matched_pattern: match?.domain,
+      matched_pattern: match?.pattern,
       matched_pattern_type: match?.pattern_type,
       matched_source: match?.source,
       matched_metadata: match?.metadata || {},

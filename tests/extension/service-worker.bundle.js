@@ -17749,7 +17749,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           allowed_by_list: allowCheck.matchedList,
           allowed_by_list_entry: allowCheck.matchEntry ? {
             list_name: allowCheck.matchedList,
-            matched_pattern: allowCheck.matchEntry.domain,
+            matched_pattern: allowCheck.matchEntry.pattern,
             matched_pattern_type: allowCheck.matchEntry.pattern_type,
             matched_source: allowCheck.matchEntry.source,
             matched_metadata: allowCheck.matchEntry.metadata || {}
@@ -17759,7 +17759,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           filtered_by_list: filteredByList,
           filtered_by_list_entry: filterMatch ? {
             list_name: filteredByList,
-            matched_pattern: filterMatch.domain,
+            matched_pattern: filterMatch.pattern,
             matched_pattern_type: filterMatch.pattern_type,
             matched_source: filterMatch.source,
             matched_metadata: filterMatch.metadata || {}
@@ -17882,7 +17882,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       recorded_url: recordedUrl,
       filtered_by_list: listName === "NOT_ON_ALLOWLIST" ? void 0 : listName,
       allowed_by_list: listName === "NOT_ON_ALLOWLIST" ? "NOT_ON_ALLOWLIST" : void 0,
-      matched_pattern: match?.domain,
+      matched_pattern: match?.pattern,
       matched_pattern_type: match?.pattern_type,
       matched_source: match?.source,
       matched_metadata: match?.metadata || {},
@@ -18027,6 +18027,24 @@ registerREXModule(plugin);
 // tests/extension/sw-entry.mts
 globalThis.chrome.runtime.onMessage.addListener(service_worker_default.handleMessage);
 var g = globalThis;
+var EventCaptureModule = class extends REXServiceWorkerModule {
+  moduleName() {
+    return "EventCapture";
+  }
+  setup() {
+  }
+  handleMessage(_msg, _sender, _sendResponse) {
+    return false;
+  }
+  logEvent(event) {
+    const arr = g.__capturedEvents;
+    if (Array.isArray(arr)) {
+      arr.push(event);
+    }
+  }
+};
+g.__capturedEvents = [];
+registerREXModule(new EventCaptureModule());
 g.__testSendMessage = (message) => new Promise((resolve) => {
   service_worker_default.handleMessage(message, {}, resolve);
 });

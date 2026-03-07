@@ -43,9 +43,16 @@ export default defineConfig({
   ],
 
   /* Run your local dev server before starting the tests */
-  webServer: {
-    command: 'python3 -m http.server -d tests/src 8082',
-    port: 8082,
-    reuseExistingServer: !process.env.CI,
-  },
+  webServer: [
+    {
+      command: 'python3 -m http.server -d tests/src 8082',
+      port: 8082,
+      reuseExistingServer: !process.env.CI,
+    },
+    {
+      command: 'node tests/scripts/run-server.js',
+      port: 3001,
+      reuseExistingServer: !process.env.CI,
+    },
+  ],
 });
