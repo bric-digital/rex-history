@@ -17947,7 +17947,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       await deleteAllEntriesInList(this.config.top_domains_list_name, "generated");
       const entries = sortedDomains.map(([domain, count]) => ({
         list_name: this.config.top_domains_list_name,
-        domain,
+        pattern: domain,
         pattern_type: "domain",
         source: "generated",
         metadata: {

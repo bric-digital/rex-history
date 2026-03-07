@@ -34,6 +34,19 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
+   * Guards against concurrent loadConfiguration() calls.
+   *
+   * loadConfiguration() calls parseAndSyncLists() which deletes-then-reinserts
+   * IndexedDB entries.  If two calls overlap (e.g. storage.onChanged fires
+   * while collectHistory's own loadConfiguration is mid-sync), the second
+   * delete can wipe entries the first call just inserted, leaving allow-lists
+   * temporarily empty during a collection cycle.
+   *
+   * By coalescing overlapping calls into a single promise we avoid the race.
+   */
+  private loadConfigurationPromise: Promise<void> | null = null
+
+  /**
    * DEV-ONLY debug flag:
    * When enabled (and running inside Webmunk Dev Extension), we emit a dataset event
    * containing the *full* original URL for filtered items so you can verify list behavior.
@@ -81,7 +94,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return
       if (changes.REXConfiguration || changes.rexIdentifier) {
-        this.loadConfiguration()
+        // Use loadConfigOnly (no list sync) to avoid racing with collection
+        // cycles.  parseAndSyncLists temporarily empties lists during its
+        // delete-then-reinsert cycle; if that overlaps with a collection the
+        // allow-list check misclassifies visits.  Lists are synced inside
+        // collectHistory() instead, where the timing is controlled.
+        this.loadConfigOnly()
           .then(async () => {
             const hasIdentifier = await this.hasIdentifier()
             if (this.config && hasIdentifier) {
@@ -133,6 +151,29 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   async loadConfiguration() {
+    if (this.loadConfigurationPromise) {
+      return this.loadConfigurationPromise
+    }
+    this.loadConfigurationPromise = this.loadConfigurationImpl(true)
+    try {
+      await this.loadConfigurationPromise
+    } finally {
+      this.loadConfigurationPromise = null
+    }
+  }
+
+  /**
+   * Reload history config from rex-core WITHOUT re-syncing lists.
+   *
+   * collectHistory() calls this instead of loadConfiguration() so that a
+   * concurrent parseAndSyncLists (which temporarily empties lists) cannot
+   * race with the collection cycle's allow-list checks.
+   */
+  private async loadConfigOnly() {
+    await this.loadConfigurationImpl(false)
+  }
+
+  private async loadConfigurationImpl(syncLists: boolean) {
     try {
       // Always fetch through rex-core, which owns configuration loading/storage.
       const configuration = await rexCorePlugin.fetchConfiguration() as REXConfiguration | undefined
@@ -153,6 +194,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         await this.saveStatus()
         console.warn('[webmunk-history] No history configuration found in rex-core configuration')
       }
+
+      if (!syncLists) return
+
       const listConfig = configurationRecord?.['lists']
       if (listConfig !== null && listConfig !== undefined && typeof listConfig === 'object' && !Array.isArray(listConfig)) {
         await listUtils.parseAndSyncLists(listConfig as Parameters<typeof listUtils.parseAndSyncLists>[0])
@@ -235,6 +279,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return Promise.resolve()
     }
 
+    // Set the flag synchronously BEFORE any async work so that concurrent
+    // callers (e.g. storage.onChanged → loadConfiguration) see isCollecting
+    // immediately and skip the destructive parseAndSyncLists cycle.
+    this.status.isCollecting = true
+
     // IMPORTANT: Do not collect or send data until user has entered an identifier
     return this.hasIdentifier()
       .then((hasIdentifier) => {
@@ -242,6 +291,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           console.warn('[webmunk-history] No identifier set - collection will not start until identifier is provided')
           return Promise.reject(new Error('NO_IDENTIFIER'))
         }
+        // Full loadConfiguration (with list sync) is safe here because
+        // isCollecting is already true, which prevents the storage.onChanged
+        // listener from starting a concurrent list sync.
         return this.loadConfiguration()
       })
       .then(() => this.waitForConfiguration())
@@ -252,7 +304,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         console.log('[webmunk-history] Starting history collection')
-        this.status.isCollecting = true
         return this.saveStatus()
       })
       .then(() => this.runCollectionCycle())
@@ -267,10 +318,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return this.setLastFetchTime(Date.now())
       })
       .finally(() => {
-        if (!this.status.isCollecting) {
-          return
-        }
-
         this.status.isCollecting = false
         return this.saveStatus().finally(() => {
           console.log('[webmunk-history] Collection complete')
@@ -342,6 +389,23 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         if (this.config?.generate_top_domains) {
           return this.generateTopDomainsList()
         }
+      })
+      .then(() => {
+        // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
+        // has elapsed since the last persist.  When multiple history events
+        // are dispatched in quick succession, only the first triggers a
+        // persist; later events stay in PDK's in-memory queue.  Dispatching
+        // a lightweight summary event after a short delay ensures the
+        // persist debounce has expired, so PDK flushes the entire queue.
+        if (collectedCount === 0) return Promise.resolve()
+        return new Promise<void>((resolve) => setTimeout(resolve, 1100))
+          .then(() => {
+            dispatchEvent({
+              name: 'rex-history-collection-complete',
+              collected_count: collectedCount,
+              date: Date.now()
+            })
+          })
       })
       .then(() => {
         this.status.lastCollectionTime = Date.now()
