@@ -1,0 +1,57 @@
+{
+    "name": "@bric/rex-history",
+    "version": "0.0.1",
+    "description": "REX module for collecting browser history data via Chrome History API.",
+    "keywords": [
+        "extension",
+        "rex",
+        "history",
+        "browsing-data"
+    ],
+    "author": "Behavioral Research Innovation Center",
+    "type": "module",
+    "homepage": "https://github.com/bric-digital/rex-history",
+    "bugs": {
+        "url": "https://github.com/bric-digital/rex-history/issues"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/bric-digital/rex-history.git"
+    },
+    "exports": {
+        "./extension": "./src/extension.mts",
+        "./browser": "./src/browser.mts",
+        "./service-worker": "./src/service-worker.mts"
+    },
+    "scripts": {
+        "build": "tsc",
+        "lint": "eslint src",
+        "pretest": "node tests/scripts/build-test-bundle.js",
+        "test": "playwright test",
+        "test:ci": "playwright test --reporter=dot",
+        "test:debug": "playwright test --debug",
+        "test:headed": "playwright test --headed",
+        "test:ui": "playwright test --ui",
+        "test:unit": "playwright test specs/",
+        "test:legacy": "node --test"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.1",
+        "@playwright/test": "^1.48.0",
+        "@types/jquery": "^3.5.33",
+        "@types/node": "^25.3.3",
+        "chrome-types": "^0.1.387",
+        "esbuild": "^0.27.2",
+        "eslint": "^9.39.1",
+        "globals": "^16.5.0",
+        "jiti": "^2.6.1",
+        "typescript": "^5.9.2",
+        "typescript-eslint": "^8.46.3"
+    },
+    "dependencies": {
+        "@bric/rex-core": "github:bric-digital/rex-core#main",
+        "@bric/rex-lists": "github:bric-digital/rex-lists#emt_test",
+        "jquery": "^3.7.1",
+        "psl": "^1.9.0"
+    }
+}
