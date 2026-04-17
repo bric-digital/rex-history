@@ -397,7 +397,21 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // persist; later events stay in PDK's in-memory queue.  Dispatching
         // a lightweight summary event after a short delay ensures the
         // persist debounce has expired, so PDK flushes the entire queue.
-        if (collectedCount === 0) return Promise.resolve()
+        // When no items were collected we still need to dispatch the
+        // completion event so callers (e.g. offboarding) know history
+        // collection finished.  Skip the 1.1s PDK-debounce delay since
+        // there is nothing queued to flush.
+        if (collectedCount === 0) {
+          dispatchEvent({
+            name: 'pdk-app-event',
+            event_name: 'rex-history-collection-complete',
+            event_details: {
+              collected_count: 0,
+              date: Date.now()
+            }
+          })
+          return Promise.resolve()
+        }
         return new Promise<void>((resolve) => setTimeout(resolve, 1100))
           .then(() => {
             dispatchEvent({
