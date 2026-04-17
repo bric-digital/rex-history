@@ -401,9 +401,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return new Promise<void>((resolve) => setTimeout(resolve, 1100))
           .then(() => {
             dispatchEvent({
-              name: 'rex-history-collection-complete',
-              collected_count: collectedCount,
-              date: Date.now()
+              name: 'pdk-app-event',
+              event_name: 'rex-history-collection-complete',
+              event_details: {
+                collected_count: collectedCount,
+                date: Date.now()
+              }
             })
           })
       })
