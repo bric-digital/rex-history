@@ -1,7 +1,8 @@
 import psl from 'psl'
 import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
-import { type REXConfiguration } from '@bric/rex-core/extension'
+import type { REXConfiguration } from '@bric/rex-core/extension'
 import * as listUtils from '@bric/rex-lists'
+import { type RexPageUrlActiveEvent } from '@bric/rex-types/types'
 
 interface HistoryConfig {
   collection_interval_minutes: number;
@@ -13,6 +14,35 @@ interface HistoryConfig {
   generate_top_domains: boolean;
   top_domains_count: number;
   top_domains_list_name: string;
+  /**
+   * Tolerance (ms) for joining a `rex-history-visit` record to a buffered
+   * `rex-page-url-active` record from `rex-page-events` (if installed).
+   * Match requires exact URL string AND |visit_time − url_shown_at| ≤ tolerance.
+   * Set to 0 to disable joining. Default 5000 when unset.
+   */
+  page_events_link_tolerance_ms?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Optional linkage to rex-page-events.
+//
+// rex-history does NOT import @bric/rex-page-events. The only seam is the
+// well-known `globalThis.__rexPageEventsUrlActive.subscribe` contract installed
+// by rex-page-events at its own setup. If the seam isn't present (because
+// rex-page-events wasn't bundled into this extension), we silently proceed
+// without linkage fields — no error, no crash.
+// ---------------------------------------------------------------------------
+
+const URL_ACTIVE_BUFFER_MAX = 256
+const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
+
+interface UrlActiveSeam {
+  subscribe(listener: (event: RexPageUrlActiveEvent) => void): () => void
+}
+
+function getUrlActiveSeam(): UrlActiveSeam | undefined {
+  return (globalThis as unknown as { __rexPageEventsUrlActive?: UrlActiveSeam })
+    .__rexPageEventsUrlActive
 }
 
 interface HistoryStatus {
@@ -32,6 +62,14 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     itemsCollected: 0,
     isCollecting: false
   }
+
+  /**
+   * Ring buffer of observed `rex-page-url-active` records from rex-page-events.
+   * Populated only when the optional seam is available. See the module header
+   * for the coupling model.
+   */
+  private urlActiveBuffer: RexPageUrlActiveEvent[] = []
+  private urlActiveUnsubscribe: (() => void) | null = null
 
   /**
    * Guards against concurrent loadConfiguration() calls.
@@ -63,6 +101,62 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     return 'HistoryServiceWorkerModule'
   }
 
+  // -------------------------------------------------------------------------
+  // Optional rex-page-events linkage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Probe for the rex-page-events subscriber seam and subscribe if present.
+   * Safe to call once per setup; idempotent if called twice in a row.
+   */
+  private trySubscribeUrlActive(): void {
+    if (this.urlActiveUnsubscribe !== null) {
+      return // already subscribed
+    }
+    const seam = getUrlActiveSeam()
+    if (seam === undefined || typeof seam.subscribe !== 'function') {
+      console.log('[rex-history] rex-page-events not detected; visits will not carry tab linkage fields')
+      return
+    }
+    this.urlActiveUnsubscribe = seam.subscribe((record) => {
+      this.recordUrlActive(record)
+    })
+    console.log('[rex-history] Subscribed to rex-page-events url-active seam')
+  }
+
+  private recordUrlActive(record: RexPageUrlActiveEvent): void {
+    this.urlActiveBuffer.push(record)
+    if (this.urlActiveBuffer.length > URL_ACTIVE_BUFFER_MAX) {
+      this.urlActiveBuffer.splice(0, this.urlActiveBuffer.length - URL_ACTIVE_BUFFER_MAX)
+    }
+  }
+
+  /**
+   * Find the most recent buffered url-active record matching the visit within
+   * tolerance. Returns null when: no match, tolerance is 0, URL is redacted
+   * (starts with `CATEGORY:`), or the seam was never wired up.
+   */
+  private findUrlActiveMatch(url: string, visitTime: number): RexPageUrlActiveEvent | null {
+    if (url.startsWith('CATEGORY:')) {
+      return null // redacted visit — never try to un-redact via linkage
+    }
+    const tolerance = this.config?.page_events_link_tolerance_ms
+      ?? DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS
+    if (tolerance <= 0) {
+      return null
+    }
+
+    let best: RexPageUrlActiveEvent | null = null
+    for (const record of this.urlActiveBuffer) {
+      if (record.url !== url) continue
+      if (Math.abs(visitTime - record.url_shown_at) > tolerance) continue
+      if (best === null || record.url_shown_at > best.url_shown_at) {
+        best = record
+      }
+    }
+    return best
+  }
+
   /**
    * Check if user identifier has been set.
    * History collection should not start until an identifier exists.
@@ -80,6 +174,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
   async setup() {
     console.log('[rex-history/service-worker] Setting up history collection module')
+
+    // Optional linkage to rex-page-events. If the seam is absent (module not
+    // bundled), the buffer stays empty and visits go out without linkage fields.
+    this.trySubscribeUrlActive()
 
     // Initialize list database
     try {
@@ -536,6 +634,25 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // Categorize against category lists
         const categories = await this.categorizeUrl(item.url)
 
+        // Attempt to link this visit to an observed rex-page-url-active record.
+        // If the visit's recorded URL is redacted (filter/domain_only/allow miss),
+        // we pass the REDACTED URL so the match short-circuits — defense in depth
+        // against accidentally un-redacting via linkage metadata. When the URL is
+        // not redacted, we pass the raw URL to match against buffer records.
+        // When rex-page-events isn't installed, the buffer is empty and this is a no-op.
+        const matchUrl = recordedUrl.startsWith('CATEGORY:') || recordedUrl === ''
+          ? recordedUrl
+          : item.url
+        const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime)
+        const linkFields = linkMatch !== null
+          ? {
+              tab_id: linkMatch.tab_id,
+              window_id: linkMatch.window_id,
+              session_id: linkMatch.session_id,
+              page_events_url_shown_at: linkMatch.url_shown_at,
+            }
+          : {}
+
         // Dispatch event to all modules (PDK will pick it up for upload)
         console.log('[rex-history] Logging event: rex-history-visit')
         dispatchEvent({
@@ -584,7 +701,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
                 matched_source: filterMatch.source,
                 matched_metadata: filterMatch.metadata || {}
               }
-            : undefined
+            : undefined,
+
+          // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
+          // Spread so these keys are simply absent when no match fired.
+          ...linkFields,
         })
 
         collectedCount++
