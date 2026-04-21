@@ -169,6 +169,35 @@
             });
         };
 
+        // ---------------------------------------------------------------
+        // Optional rex-page-events seam (for linkage spec)
+        //
+        // If the query string contains `?urlActive=on`, we install a mock
+        // `globalThis.__rexPageEventsUrlActive` seam BEFORE the shim bundle
+        // loads so rex-history's setup() subscribes to it. Tests then drive
+        // url-active records into the buffer by calling the exposed emit helper.
+        //
+        // Without the flag, the seam is absent and rex-history runs with no
+        // buffer — this proves optional degradation.
+        // ---------------------------------------------------------------
+        if (new URLSearchParams(location.search).get('urlActive') === 'on') {
+            window.__urlActiveSubscribers = [];
+            window.__rexPageEventsUrlActive = {
+                subscribe: (listener) => {
+                    window.__urlActiveSubscribers.push(listener);
+                    return () => {
+                        const idx = window.__urlActiveSubscribers.indexOf(listener);
+                        if (idx !== -1) window.__urlActiveSubscribers.splice(idx, 1);
+                    };
+                },
+            };
+            window.__emitUrlActive = (record) => {
+                for (const listener of [...window.__urlActiveSubscribers]) {
+                    listener(record);
+                }
+            };
+        }
+
         // Set ready status
         document.getElementById('status').textContent = '✅ Test environment loaded and ready';
         document.getElementById('status').className = 'ready';
