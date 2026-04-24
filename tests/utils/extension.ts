@@ -2,7 +2,10 @@ import type { BrowserContext, Worker } from '@playwright/test'
 import { expect } from '@playwright/test'
 
 type ServiceWorkerLike = {
-  evaluate: (pageFunction: any, arg?: unknown) => Promise<unknown> // eslint-disable-line @typescript-eslint/no-explicit-any
+  evaluate: <R, Arg = undefined>(
+    pageFunction: (arg: Arg) => R | Promise<R>,
+    arg?: Arg
+  ) => Promise<R>
 }
 
 /** Open a page, navigate to the URL, then close it — mirrors Keystone's visitUrl. */
