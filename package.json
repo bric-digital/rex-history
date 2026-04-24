@@ -35,24 +35,11 @@
         "test:unit": "playwright test specs/",
         "test:legacy": "node --test"
     },
-    "devDependencies": {
-        "@eslint/js": "^9.39.1",
-        "@playwright/test": "^1.48.0",
-        "@types/jquery": "^3.5.33",
-        "@types/node": "^25.3.3",
-        "chrome-types": "^0.1.387",
-        "esbuild": "^0.27.2",
-        "eslint": "^9.39.1",
-        "globals": "^16.5.0",
-        "jiti": "^2.6.1",
-        "typescript": "^5.9.2",
-        "typescript-eslint": "^8.46.3"
-    },
     "dependencies": {
-        "@bric/rex-core": "github:bric-digital/rex-core#main",
-        "@bric/rex-lists": "github:bric-digital/rex-lists#main",
+        "@bric/rex-core": "github:bric-digital/rex-core",
+        "@bric/rex-lists": "github:bric-digital/rex-lists",
         "@bric/rex-types": "github:bric-digital/rex-types",
-        "jquery": "^3.7.1",
+        "@types/node": "^25.6.0",
         "psl": "^1.9.0"
     }
 }

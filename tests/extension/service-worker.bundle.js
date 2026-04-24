@@ -10664,7 +10664,7 @@ async function mergeBackendList(listName, entries) {
       console.log(`[list-utilities] Deleted ${entriesToDelete.length} conflicting entries for ${listName}`);
     } catch (error) {
       console.error(`[list-utilities] Failed to delete conflicting entries:`, error);
-      throw new Error(`Failed to clear conflicts before sync: ${error instanceof Error ? error.message : "unknown"}`);
+      throw new Error(`Failed to clear conflicts before sync: ${error instanceof Error ? error.message : "unknown"}`, { cause: error });
     }
   }
   const newEntries = [];

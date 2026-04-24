@@ -567,7 +567,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           // Keep default 'not available' for invalid URLs
         }
 
-        let recordedUrl = item.url
+        let recordedUrl = item.url // eslint-disable-line no-useless-assignment
         let recordedTitle = item.title || ''
         let filteredByList: string | undefined
         let filterMatch: listUtils.ListEntry | undefined
