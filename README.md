@@ -37,6 +37,7 @@ This module reads from the `history` section of the backend config.
 | `generate_top_domains` | boolean | No | false | Whether to generate a list of top-visited domains |
 | `top_domains_count` | number | No | 100 | Number of domains to include in top domains list |
 | `top_domains_list_name` | string | No | "top-visited-domains" | Name for the generated top domains list |
+| `page_events_link_tolerance_ms` | number | No | 5000 | Optional linkage to **rex-page-events**. Tolerance (ms) for matching a `rex-history-visit` to a buffered `rex-page-url-active` record by `(url, visit_time ≈ url_shown_at)`. Set to `0` to disable matching. Has no effect when `rex-page-events` is not installed. |
 
 ### Example
 
@@ -140,6 +141,33 @@ Then run `npm install`.
 - `./extension` - Extension UI context
 - `./browser` - Browser/content script context
 - `./service-worker` - Service worker context (main collection logic)
+
+## Linking to rex-page-events (optional)
+
+If **rex-page-events** is installed alongside rex-history in the same extension, each `rex-history-visit` record may additionally carry:
+
+- `tab_id` — the tab the URL was observed in
+- `window_id` — the window that tab belonged to
+- `session_id` — the per-tab UUID minted by rex-page-events at `tab_open`
+- `page_events_url_shown_at` — the `Date.now()` timestamp when rex-page-events saw that URL become active in the tab
+
+These fields let analysts join `rex-history-visit` records with `rex-page-event` records exactly: by `session_id` within a tab, or by `(url, page_events_url_shown_at ≈ visit_time)` at the visit level.
+
+**rex-history does not import `@bric/rex-page-events`.** At startup it probes `globalThis.__rexPageEventsUrlActive` — a tiny seam installed by rex-page-events' own service worker — and subscribes if present. If rex-page-events isn't bundled into the extension, the probe returns `undefined`, no subscription happens, and visits go out without the linkage fields. No error, no warning beyond a single info-level log line.
+
+**Redacted URLs are never matched.** If rex-history's own filter/allow/domain_only lists would replace the visit's URL with `CATEGORY:…`, the linkage lookup short-circuits: no `tab_id` / `session_id` is stapled onto a redacted visit, even if a matching record exists in the buffer. Privacy-preserving by design.
+
+**Tuning.** Set `page_events_link_tolerance_ms` to widen or narrow the time window. Default 5000ms comfortably covers `chrome.history`'s recording lag. Set to `0` to disable matching entirely while still buffering records (useful for debug telemetry).
+
+## Coupling model
+
+This module and `rex-page-events` use **two different kinds of coupling on purpose.**
+
+**Code — loosely coupled.** Neither module imports the other. Neither lists the other in `package.json` dependencies. The only connection is a convention: `rex-page-events` installs a `subscribe` function on `globalThis.__rexPageEventsUrlActive` at service-worker startup, and `rex-history` probes for it at its own startup. If the probe returns undefined (because `rex-page-events` wasn't included in the extension build), `rex-history` proceeds without linkage fields. Either module can ship, update, or be removed independently. The only shared surface is the `RexPageUrlActiveEvent` type in `@bric/rex-types`.
+
+**Data — tightly coupled.** Once both modules are present, every `rex-history-visit` record that matches a buffered `rex-page-url-active` gets `tab_id`, `window_id`, `session_id`, and `page_events_url_shown_at` stapled onto it. A visit's `session_id` means exactly the same thing as the page-event's `session_id` for the same tab lifetime — analysts can treat the two streams as one correlated dataset, joining on `session_id` for exact-within-tab analysis or on `(url, page_events_url_shown_at ≈ visit_time)` for visit-level analysis.
+
+Put simply: loose at the code seam so each module is independently useful, tight at the data seam so the output is analyzable as a single story.
 
 ## License
 

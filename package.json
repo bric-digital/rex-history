@@ -51,6 +51,7 @@
     "dependencies": {
         "@bric/rex-core": "github:bric-digital/rex-core#main",
         "@bric/rex-lists": "github:bric-digital/rex-lists#emt_test",
+        "@bric/rex-types": "github:bric-digital/rex-types",
         "jquery": "^3.7.1",
         "psl": "^1.9.0"
     }
