@@ -143,3 +143,4 @@ test-results/
 playwright-report/
 playwright/.cache/
 tests/src/build/
+tests/extension/service-worker.bundle.js
