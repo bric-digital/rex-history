@@ -152,7 +152,7 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
     })
 
     expect(alarm).toBeTruthy()
-    expect(alarm.periodInMinutes).toBe(30)
+    expect(alarm!.periodInMinutes).toBe(30)
   })
 
   test('getHistoryStatus message returns current module status', async () => {

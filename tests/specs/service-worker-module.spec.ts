@@ -317,7 +317,7 @@ test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => 
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'domain-only-sites',
-        domain: 'facebook.com',
+        pattern: 'facebook.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: {}
@@ -348,7 +348,7 @@ test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => 
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'domain-only-sites',
-        domain: 'facebook.com',
+        pattern: 'facebook.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: {}
@@ -379,14 +379,14 @@ test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => 
       await (window as any).__listUtils.bulkCreateListEntries([
         {
           list_name: 'domain-only-sites',
-          domain: 'facebook.com',
+          pattern: 'facebook.com',
           pattern_type: 'domain',
           source: 'server',
           metadata: {}
         },
         {
           list_name: 'social-media-categories',
-          domain: 'facebook.com',
+          pattern: 'facebook.com',
           pattern_type: 'domain',
           source: 'server',
           metadata: { category: 'social-media' }
@@ -450,7 +450,7 @@ test.describe('HistoryServiceWorkerModule — Filter Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'sensitive-sites',
-        domain: 'reddit.com',
+        pattern: 'reddit.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: { category: 'social-media' }
@@ -481,7 +481,7 @@ test.describe('HistoryServiceWorkerModule — Filter Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'sensitive-sites',
-        domain: 'reddit.com',
+        pattern: 'reddit.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: { category: 'social-media' }
@@ -512,7 +512,7 @@ test.describe('HistoryServiceWorkerModule — Filter Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'sensitive-sites',
-        domain: 'reddit.com',
+        pattern: 'reddit.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: { category: 'social-media' }
@@ -542,7 +542,7 @@ test.describe('HistoryServiceWorkerModule — Filter Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'sensitive-sites',
-        domain: 'example.com',
+        pattern: 'example.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: {}
@@ -601,7 +601,7 @@ test.describe('HistoryServiceWorkerModule — Allow Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'study-sites',
-        domain: 'bbc.com',
+        pattern: 'bbc.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: {}
@@ -630,7 +630,7 @@ test.describe('HistoryServiceWorkerModule — Allow Lists', () => {
     await page.evaluate(async () => {
       await (window as any).__listUtils.bulkCreateListEntries([{
         list_name: 'study-sites',
-        domain: 'bbc.com',
+        pattern: 'bbc.com',
         pattern_type: 'domain',
         source: 'server',
         metadata: {}

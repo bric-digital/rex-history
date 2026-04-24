@@ -1,6 +1,6 @@
 import psl from 'psl'
 import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
-import type { REXConfiguration } from '@bric/rex-core/extension'
+import type { REXConfiguration } from '@bric/rex-core/common'
 import * as listUtils from '@bric/rex-lists'
 import { type RexPageUrlActiveEvent } from '@bric/rex-types/types'
 
