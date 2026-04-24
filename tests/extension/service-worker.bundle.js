@@ -10350,6 +10350,7 @@ var oa = (e) => {
 var na = { parse: O, get: aa, isValid: oa };
 
 // node_modules/@bric/rex-lists/src/list-utilities.mts
+var debugEnabled = false;
 function normalizeLeadingWww(host) {
   return host.toLowerCase().replace(/^www\./, "");
 }
@@ -10363,7 +10364,7 @@ function isStrictRegisteredDomain(pattern) {
   return candidate === domain;
 }
 var DB_NAME = "webmunk_lists";
-var DB_VERSION = 3;
+var DB_VERSION = 4;
 var STORE_NAME = "list_entries";
 async function initializeListDatabase() {
   return new Promise((resolve, reject) => {
@@ -10385,11 +10386,28 @@ async function initializeListDatabase() {
       const transaction = event.target.transaction;
       if (!transaction) return;
       const objectStore = transaction.objectStore(STORE_NAME);
+      if ((event.oldVersion ?? 0) < 4) {
+        const cursorRequest = objectStore.openCursor();
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (!cursor) return;
+          const record = cursor.value;
+          if ("domain" in record && !("pattern" in record)) {
+            record.pattern = record.domain;
+            delete record.domain;
+            cursor.update(record);
+          }
+          cursor.continue();
+        };
+      }
       if (!objectStore.indexNames.contains("list_name")) {
         objectStore.createIndex("list_name", "list_name", { unique: false });
       }
-      if (!objectStore.indexNames.contains("domain")) {
-        objectStore.createIndex("domain", "domain", { unique: false });
+      if (objectStore.indexNames.contains("domain")) {
+        objectStore.deleteIndex("domain");
+      }
+      if (!objectStore.indexNames.contains("pattern")) {
+        objectStore.createIndex("pattern", "pattern", { unique: false });
       }
       if (!objectStore.indexNames.contains("source")) {
         objectStore.createIndex("source", "source", { unique: false });
@@ -10400,15 +10418,19 @@ async function initializeListDatabase() {
       if (objectStore.indexNames.contains("list_name_domain")) {
         objectStore.deleteIndex("list_name_domain");
       }
-      objectStore.createIndex("list_name_domain", ["list_name", "domain"], { unique: false });
+      if (!objectStore.indexNames.contains("list_name_pattern")) {
+        objectStore.createIndex("list_name_pattern", ["list_name", "pattern"], { unique: false });
+      }
       if (objectStore.indexNames.contains("list_name_pattern_type_domain")) {
         objectStore.deleteIndex("list_name_pattern_type_domain");
       }
-      objectStore.createIndex(
-        "list_name_pattern_type_domain",
-        ["list_name", "pattern_type", "domain"],
-        { unique: true }
-      );
+      if (!objectStore.indexNames.contains("list_name_pattern_type_pattern")) {
+        objectStore.createIndex(
+          "list_name_pattern_type_pattern",
+          ["list_name", "pattern_type", "pattern"],
+          { unique: true }
+        );
+      }
       console.log("[list-utilities] Ensured object store and indexes");
     };
   });
@@ -10471,13 +10493,13 @@ async function deleteAllEntriesInList(listName, sourceFilter) {
     }
   });
 }
-async function findListEntryByPattern(listName, patternType, domain) {
+async function findListEntryByPattern(listName, patternType, pattern) {
   const db = await getDatabase();
   return new Promise((resolve, reject) => {
     const transaction = db.transaction(STORE_NAME, "readonly");
     const store = transaction.objectStore(STORE_NAME);
-    const index = store.index("list_name_pattern_type_domain");
-    const request = index.get([listName, patternType, domain]);
+    const index = store.index("list_name_pattern_type_pattern");
+    const request = index.get([listName, patternType, pattern]);
     request.onsuccess = () => {
       resolve(request.result || null);
     };
@@ -10488,8 +10510,12 @@ async function findListEntryByPattern(listName, patternType, domain) {
 }
 async function matchDomainAgainstList(url, listName) {
   const entries = await getListEntries(listName);
+  if (debugEnabled) {
+    console.log(`[rex-lists] matchDomainAgainstList`);
+    console.log(entries);
+  }
   for (const entry of entries) {
-    if (matchesPattern(url, entry.domain, entry.pattern_type)) {
+    if (matchesPattern(url, entry.pattern, entry.pattern_type)) {
       return entry;
     }
   }
@@ -10500,7 +10526,7 @@ async function bulkCreateListEntries(entries) {
   const uniqueKeys = /* @__PURE__ */ new Set();
   const duplicatesInArray = [];
   entries.forEach((entry, index) => {
-    const key = `${entry.list_name}:${entry.pattern_type}:${entry.domain}`;
+    const key = `${entry.list_name}:${entry.pattern_type}:${entry.pattern}`;
     if (uniqueKeys.has(key)) {
       duplicatesInArray.push({ index, key });
     }
@@ -10541,7 +10567,7 @@ async function bulkCreateListEntries(entries) {
           event.preventDefault();
           skipped++;
           console.warn(
-            `[list-utilities] Skipping duplicate entry at index ${index} (${entry.list_name}:${entry.pattern_type}:${entry.domain})`
+            `[list-utilities] Skipping duplicate entry at index ${index} (${entry.list_name}:${entry.pattern_type}:${entry.pattern})`
           );
           if (completed + skipped === entries.length) {
             console.warn(`[list-utilities] Bulk insert completed with ${skipped} skipped duplicates`);
@@ -10551,13 +10577,13 @@ async function bulkCreateListEntries(entries) {
           const errorDetails = {
             list_name: entry.list_name,
             pattern_type: entry.pattern_type,
-            domain: entry.domain,
+            pattern: entry.pattern,
             source: entry.source,
             index,
             error: request.error?.message
           };
           console.error("[list-utilities] Bulk insert failed at entry:", errorDetails);
-          reject(new Error(`Failed to create bulk entry at index ${index} (${entry.list_name}:${entry.pattern_type}:${entry.domain}): ${request.error?.message}`));
+          reject(new Error(`Failed to create bulk entry at index ${index} (${entry.list_name}:${entry.pattern_type}:${entry.pattern}): ${request.error?.message}`));
         }
       };
     });
@@ -10617,15 +10643,15 @@ async function mergeBackendList(listName, entries) {
   const entriesToDelete = [];
   for (const entry of entries) {
     try {
-      const domain = entry?.domain;
+      const pattern = entry?.pattern ?? entry?.domain;
       const patternType = entry?.pattern_type;
-      if (typeof domain !== "string" || domain.length === 0) continue;
+      if (typeof pattern !== "string" || pattern.length === 0) continue;
       if (!patternType) continue;
-      const existing = await findListEntryByPattern(listName, patternType, domain);
+      const existing = await findListEntryByPattern(listName, patternType, pattern);
       if (existing?.id !== void 0) {
         entriesToDelete.push(existing.id);
         console.log(
-          `[list-utilities] Found conflicting entry for ${listName}:${patternType}:${domain} (source=${existing.source ?? "unknown"}) - will delete`
+          `[list-utilities] Found conflicting entry for ${listName}:${patternType}:${pattern} (source=${existing.source ?? "unknown"}) - will delete`
         );
       }
     } catch (error) {
@@ -10643,21 +10669,21 @@ async function mergeBackendList(listName, entries) {
   }
   const newEntries = [];
   for (const entry of entries) {
-    const domain = entry?.domain;
+    const pattern = entry?.pattern ?? entry?.domain;
     const patternType = entry?.pattern_type;
-    if (typeof domain !== "string" || domain.length === 0 || !patternType) {
-      console.warn(`[list-utilities] Skipping invalid backend list entry (missing domain/pattern_type) for ${listName}:`, entry);
+    if (typeof pattern !== "string" || pattern.length === 0 || !patternType) {
+      console.warn(`[list-utilities] Skipping invalid backend list entry (missing pattern/pattern_type) for ${listName}:`, entry);
       continue;
     }
-    if (patternType === "domain" && !isStrictRegisteredDomain(domain)) {
+    if (patternType === "domain" && !isStrictRegisteredDomain(pattern)) {
       console.error(
-        `[list-utilities] Invalid backend 'domain' pattern "${domain}" in list "${listName}". This would be misleading/broad. Use a registered domain like "google.com", or pattern_type "host"/"regex" for subdomains. Skipping entry.`
+        `[list-utilities] Invalid backend 'domain' pattern "${pattern}" in list "${listName}". This would be misleading/broad. Use a registered domain like "google.com", or pattern_type "host"/"regex" for subdomains. Skipping entry.`
       );
       continue;
     }
     newEntries.push({
       list_name: listName,
-      domain,
+      pattern,
       pattern_type: patternType,
       source: "backend",
       metadata: {
@@ -10675,6 +10701,9 @@ function matchesPattern(url, pattern, patternType) {
   try {
     const urlObj = new URL(url);
     const hostname = urlObj.hostname;
+    if (debugEnabled) {
+      console.log(`[rex-lists] matchesPattern("${url}", "${pattern}", "${patternType}")`);
+    }
     switch (patternType) {
       case "domain": {
         if (!isStrictRegisteredDomain(pattern)) {
@@ -10689,6 +10718,10 @@ function matchesPattern(url, pattern, patternType) {
         if (!urlDomain) return false;
         return urlDomain === normalizeLeadingWww(pattern.trim());
       }
+      case "subdomain_wildcard":
+      // Server-side alias for 'host'. The server stores this pattern type as 'subdomain_wildcard'
+      // (a legacy name), but behavior is identical to 'host': exact hostname match, www-normalized.
+      // Falls through intentionally.
       case "host": {
         const urlHostNormalized = normalizeLeadingWww(hostname);
         let patternHost = pattern;
