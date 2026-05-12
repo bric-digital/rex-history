@@ -49,6 +49,7 @@ interface HistoryStatus {
   lastCollectionTime?: number;
   itemsCollected: number;
   isCollecting: boolean;
+  listsReady?: boolean;
   configSource?: 'server' | 'none';
   effectiveConfig?: HistoryConfig;
 }
@@ -83,7 +84,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * By coalescing overlapping calls into a single promise we avoid the race.
    */
   private loadConfigurationPromise: Promise<void> | null = null
-  private listsReady: boolean = false
 
   /**
    * DEV-ONLY debug flag:
@@ -214,9 +214,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
     })
 
-    // Load configuration
+    // Load status from storage before configuration so that listsReady
+    // persisted from a previous run is available before the alarm can fire.
+    await this.loadStatus()
+
+    // Load configuration and sync lists. Sets listsReady so collection is
+    // allowed. On a service worker restart with a pre-populated IndexedDB,
+    // loadStatus() above will have already restored listsReady: true, so any
+    // alarm that fires during this re-sync won't be blocked.
     await this.loadConfiguration()
-    this.listsReady = true
+    this.status.listsReady = true
+    await this.saveStatus()
 
     // Set up periodic collection alarm ONLY if identifier exists
     const hasIdentifier = await this.hasIdentifier()
@@ -236,18 +244,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         })
       }
     })
-
-    // Message listener registration is handled by rex-core; registering here
-    // would create a duplicate listener. Kept commented for reference.
-    // chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    //   return this.handleMessage(message, sender, sendResponse)
-    // })
-
-    // Load status from storage
-    await this.loadStatus()
-
-    // Ensure status reflects current effective configuration + source
-    await this.loadConfiguration()
   }
 
   async loadConfiguration() {
@@ -379,7 +375,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return Promise.resolve()
     }
 
-    if (!this.listsReady) {
+    if (!this.status.listsReady) {
       console.log('[rex-history] Lists not yet synced, skipping collection')
       return Promise.resolve()
     }
