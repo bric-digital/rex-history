@@ -218,13 +218,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     // persisted from a previous run is available before the alarm can fire.
     await this.loadStatus()
 
-    // Load configuration and sync lists. Sets listsReady so collection is
-    // allowed. On a service worker restart with a pre-populated IndexedDB,
-    // loadStatus() above will have already restored listsReady: true, so any
-    // alarm that fires during this re-sync won't be blocked.
+    // Load configuration and sync lists. loadConfigurationImpl sets
+    // listsReady once at least one allow-list has entries in IndexedDB.
+    // On a service worker restart with a pre-populated DB, loadStatus()
+    // above already restored listsReady: true so collection isn't blocked
+    // while the re-sync runs.
     await this.loadConfiguration()
-    this.status.listsReady = true
-    await this.saveStatus()
 
     // Set up periodic collection alarm ONLY if identifier exists
     const hasIdentifier = await this.hasIdentifier()
@@ -298,6 +297,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         await listUtils.parseAndSyncLists(listConfig as Parameters<typeof listUtils.parseAndSyncLists>[0])
         console.log('[rex-history] Lists synced.')
       }
+
+      const allowLists = this.config?.allow_lists
+      if (!allowLists || allowLists.length === 0) {
+        this.status.listsReady = true
+      } else {
+        const checks = await Promise.all(allowLists.map((name) => listUtils.hasListEntries(name)))
+        if (checks.some(Boolean)) {
+          this.status.listsReady = true
+        }
+      }
+      await this.saveStatus()
 
     } catch (error) {
       console.error('[rex-history] Failed to load configuration:', error)
