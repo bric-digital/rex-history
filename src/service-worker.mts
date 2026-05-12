@@ -83,6 +83,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * By coalescing overlapping calls into a single promise we avoid the race.
    */
   private loadConfigurationPromise: Promise<void> | null = null
+  private listsReady: boolean = false
 
   /**
    * DEV-ONLY debug flag:
@@ -215,6 +216,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
     // Load configuration
     await this.loadConfiguration()
+    this.listsReady = true
 
     // Set up periodic collection alarm ONLY if identifier exists
     const hasIdentifier = await this.hasIdentifier()
@@ -374,6 +376,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   collectHistory(): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
+      return Promise.resolve()
+    }
+
+    if (!this.listsReady) {
+      console.log('[rex-history] Lists not yet synced, skipping collection')
       return Promise.resolve()
     }
 
