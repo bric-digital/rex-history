@@ -919,6 +919,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       'exact_url': 5,
       'regex': 4,
       'host_path_prefix': 3,
+      'subdomain_wildcard': 2,
       'host': 2,
       'domain': 1
     }
