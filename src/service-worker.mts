@@ -791,6 +791,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   private emitSkippedDiagnostic(item: chrome.history.HistoryItem, failedStep: string, error: unknown): void {
     try {
       const shape = item.url ? this.safeUrlShape(item.url) : { scheme: 'not available', hostname_length: 0, has_query: false }
+      let errorName = 'unknown'
+      let errorMessage = String(error)
+      if (error instanceof Error) {
+        errorName = error.name
+        errorMessage = error.message
+      }
 
       dispatchEvent({
         name: 'pdk-app-event',
@@ -798,8 +804,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         event_details: {
           domain: item.url ? this.safeRegisteredDomain(item.url) : 'not available',
           failed_step: failedStep,
-          error_name: error instanceof Error ? error.name : 'unknown',
-          error_message: error instanceof Error ? error.message : String(error),
+          error_name: errorName,
+          error_message: errorMessage,
           url_length: item.url ? item.url.length : 0,
           hostname_length: shape.hostname_length,
           title_length: item.title ? item.title.length : 0,
