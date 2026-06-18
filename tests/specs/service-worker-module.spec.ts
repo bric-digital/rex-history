@@ -895,3 +895,134 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     expect(secondUrls).toContain('https://www.second.com')
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Bad-Record Resilience', () => {
+  /**
+   * Wait until a collection cycle has settled (isCollecting back to false).
+   * Unlike waitForCollectionComplete, this does NOT require lastCollectionTime,
+   * so it still returns when a cycle aborts early — exactly the case under test.
+   */
+  async function waitForCollectionSettled(page: import('@playwright/test').Page) {
+    // Let the alarm handler flip isCollecting to true first, then wait for false.
+    await page.waitForFunction(
+      () => {
+        const status = (window as any).chrome.storage.local._data.webmunkHistoryStatus
+        return status && status.isCollecting === false
+      },
+      { timeout: 10_000 }
+    )
+  }
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('a record whose getVisits throws does not stop the rest of the batch', async ({ page }) => {
+    const now = Date.now()
+
+    // Three items. The middle one is "poison": getVisits rejects for its URL,
+    // mimicking a pathological record in a participant's history. Items before
+    // AND after it must still be collected, and the completion event must fire.
+    await addHistoryItem(page, 'https://www.before.com', 'Before', now - 3000)
+    await addHistoryItem(page, 'https://www.poison.com', 'Poison', now - 2000)
+    await addHistoryItem(page, 'https://www.after.com', 'After', now - 1000)
+
+    // Make getVisits throw only for the poison URL, leaving others intact.
+    await page.evaluate(() => {
+      const history = (window as any).chrome.history
+      const originalGetVisits = history.getVisits
+      history.getVisits = async ({ url }: { url: string }) => {
+        if (url === 'https://www.poison.com') {
+          throw new Error('simulated chrome.history.getVisits failure')
+        }
+        return originalGetVisits({ url })
+      }
+    })
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionSettled(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+
+    const visitUrls = events
+      .filter((e) => e.name === 'rex-history-visit')
+      .map((e) => e.url as string)
+
+    // The good records on either side of the poison record must survive.
+    expect(visitUrls).toContain('https://www.before.com')
+    expect(visitUrls).toContain('https://www.after.com')
+
+    // The completion event must still be dispatched so downstream consumers
+    // (offboarding, researcher dashboards) know history collection finished.
+    const completed = events.some(
+      (e) => e.event_name === 'rex-history-collection-complete'
+    )
+    expect(completed).toBe(true)
+  })
+
+  test('a skipped record emits a privacy-safe rex-history-skipped diagnostic event', async ({ page }) => {
+    const now = Date.now()
+
+    await addHistoryItem(page, 'https://www.poison.com/secret-path?token=abc', 'Sensitive Title', now - 2000)
+
+    await page.evaluate(() => {
+      const history = (window as any).chrome.history
+      const originalGetVisits = history.getVisits
+      history.getVisits = async ({ url }: { url: string }) => {
+        if (url.startsWith('https://www.poison.com')) {
+          throw new Error('simulated chrome.history.getVisits failure')
+        }
+        return originalGetVisits({ url })
+      }
+    })
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionSettled(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+
+    // Emitted in the pdk-app-event family (no new data type for the backend).
+    const skipped = events.find(
+      (e) => e.name === 'pdk-app-event' && e.event_name === 'rex-history-skipped'
+    )
+    expect(skipped).toBeTruthy()
+
+    const details = skipped!.event_details as Record<string, unknown>
+
+    // Researcher-useful, privacy-safe diagnostic fields.
+    expect(details.domain).toBe('poison.com')
+    expect(details.failed_step).toBe('getVisits')
+    expect(typeof details.error_name).toBe('string')
+    expect(typeof details.error_message).toBe('string')
+    expect(details.url_length).toBe('https://www.poison.com/secret-path?token=abc'.length)
+    expect(details.hostname_length).toBe('www.poison.com'.length)
+    expect(details.title_length).toBe('Sensitive Title'.length)
+    expect(details.scheme).toBe('https:')
+    expect(details.has_query).toBe(true)
+    expect(details.history_item_id).toBeTruthy()
+
+    // Privacy: the raw URL and title must NEVER appear in the diagnostic.
+    const serialized = JSON.stringify(skipped)
+    expect(serialized).not.toContain('secret-path')
+    expect(serialized).not.toContain('token=abc')
+    expect(serialized).not.toContain('Sensitive Title')
+  })
+})
