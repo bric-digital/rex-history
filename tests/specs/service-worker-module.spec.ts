@@ -1026,3 +1026,81 @@ test.describe('HistoryServiceWorkerModule — Bad-Record Resilience', () => {
     expect(serialized).not.toContain('Sensitive Title')
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Stranded isCollecting flag (Defect D)', () => {
+  /**
+   * Reproduces the permanent wedge: in MV3 the service worker can be suspended
+   * mid-collection, after collectHistory() has set isCollecting and persisted it
+   * but before the .finally() that resets it. On the next worker start,
+   * loadStatus() reads the stranded `true` back from storage, and the guard at
+   * the top of collectHistory() then skips every future collection forever.
+   *
+   * The fix: isCollecting is in-memory concurrency state for a single worker
+   * lifetime and must never block a fresh worker. A restart must always start
+   * collectable, regardless of what is in storage.
+   */
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('a worker restart with a stranded isCollecting:true still collects', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'https://www.example.com', 'Example', now - 1000)
+
+    // Simulate the post-suspension state: storage carries isCollecting:true that
+    // the previous (killed) worker never got to reset. Then re-run loadStatus()
+    // to mimic a fresh worker reading that state on start.
+    await page.evaluate(async () => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryStatus = { ...data.webmunkHistoryStatus, isCollecting: true }
+      await window.chrome.storage.local.set(data)
+      // Mirror what setup() does on a worker restart.
+      await (window as any).__historyPlugin.loadStatus()
+    })
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const visitUrls = events
+      .filter((e) => e.name === 'rex-history-visit')
+      .map((e) => e.url as string)
+
+    // If the stranded flag still wedged the worker, no visit would ever be
+    // collected and this would be empty.
+    expect(visitUrls).toContain('https://www.example.com')
+  })
+
+  test('loadStatus() clears a stranded isCollecting on worker start', async ({ page }) => {
+    // The self-heal contract: a worker reading a stranded `true` from storage
+    // must come up with isCollecting false, so the guard in collectHistory()
+    // does not skip every future cycle. This is what unwedges participants who
+    // were suspended mid-cycle on a previous build.
+    const collectingAfterLoad = await page.evaluate(async () => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryStatus = { ...data.webmunkHistoryStatus, isCollecting: true }
+      await window.chrome.storage.local.set(data)
+
+      const plugin = (window as any).__historyPlugin
+      await plugin.loadStatus()
+      return plugin.status.isCollecting as boolean
+    })
+
+    expect(collectingAfterLoad).toBe(false)
+  })
+})
