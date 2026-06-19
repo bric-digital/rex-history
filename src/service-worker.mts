@@ -336,6 +336,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     } catch (error) {
       console.error('[rex-history] Failed to load status:', error)
     }
+    // isCollecting is in-memory concurrency state for a single worker lifetime,
+    // not durable status. A fresh worker must always start collectable. Forcing
+    // it false here self-heals participants whose previous worker was suspended
+    // mid-cycle and stranded a `true` in storage (it would otherwise wedge every
+    // future collection via the guard in collectHistory).
+    this.status.isCollecting = false
   }
 
   async saveStatus() {
