@@ -554,6 +554,14 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     for (const item of historyItems) {
       if (!item.url) continue
 
+      // Isolate each item: a single pathological record (e.g. a URL that makes
+      // chrome.history.getVisits or list matching throw) must not abort the whole
+      // batch. On failure we log, skip the record, and continue so the rest of the
+      // batch is collected and the completion event still fires.
+      // Tracks the operation in progress so a skip diagnostic can report which
+      // step threw. Updated before each step that can reject.
+      let failedStep = 'getVisits'
+      try {
       // Get visits for this item
       const visits = await chrome.history.getVisits({ url: item.url })
 
@@ -580,7 +588,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           // Keep default 'not available' for invalid URLs
         }
 
-        let recordedUrl = item.url // eslint-disable-line no-useless-assignment
+        let recordedUrl = item.url
         let recordedTitle = item.title || ''
         let filteredByList: string | undefined
         let filterMatch: listUtils.ListEntry | undefined
@@ -588,6 +596,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // Apply domain_only_lists FIRST: takes precedence over allow_lists.
         // URLs on a domain_only_list are always collected at domain resolution,
         // regardless of allow_list membership.
+        failedStep = 'list-matching'
         const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
           visit_id: visit.visitId,
           visit_time: visit.visitTime,
@@ -645,6 +654,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         // Categorize against category lists
+        failedStep = 'categorize'
         const categories = await this.categorizeUrl(item.url)
 
         // Attempt to link this visit to an observed rex-page-url-active record.
@@ -667,6 +677,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           : {}
 
         // Dispatch event to all modules (PDK will pick it up for upload)
+        failedStep = 'dispatch'
         console.log('[rex-history] Logging event: rex-history-visit')
         dispatchEvent({
           name: 'rex-history-visit',
@@ -723,9 +734,92 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
         collectedCount++
       }
+      } catch (error) {
+        console.error(`[rex-history] Skipping history item due to error processing it: ${item.url}`, error)
+        this.emitSkippedDiagnostic(item, failedStep, error)
+      }
     }
 
     return { collectedCount, maxVisitTime }
+  }
+
+  /**
+   * Extract the registered domain from a URL using psl, returning 'not available'
+   * for anything unparseable. Never throws.
+   */
+  private safeRegisteredDomain(url: string): string {
+    try {
+      const parsed = psl.parse(new URL(url).hostname)
+      if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
+        return parsed.domain
+      }
+    } catch {
+      // fall through to default
+    }
+    return 'not available'
+  }
+
+  /**
+   * Privacy-safe shape descriptors for a URL: scheme, hostname length, and
+   * whether it carries a query string. These help recognise a pathological
+   * record (e.g. a giant URL, or one whose query string trips a redaction
+   * regex) without exposing any URL content. Never throws.
+   */
+  private safeUrlShape(url: string): { scheme: string; hostname_length: number; has_query: boolean } {
+    try {
+      const parsed = new URL(url)
+      return {
+        scheme: parsed.protocol,
+        hostname_length: parsed.hostname.length,
+        has_query: parsed.search.length > 0
+      }
+    } catch {
+      return { scheme: 'not available', hostname_length: 0, has_query: false }
+    }
+  }
+
+  /**
+   * Emit a privacy-safe diagnostic when a history item is skipped because
+   * processing it threw. Researchers can see that (and why) a record was dropped
+   * without the raw URL or title ever leaving the device.
+   *
+   * Deliberately omits the raw URL and title. The lengths, URL shape, error
+   * details, and which step failed are enough to recognise a pathological record
+   * and act on it server-side. Emitted in the pdk-app-event family so it does
+   * not introduce a new data type.
+   */
+  private emitSkippedDiagnostic(item: chrome.history.HistoryItem, failedStep: string, error: unknown): void {
+    try {
+      const shape = item.url ? this.safeUrlShape(item.url) : { scheme: 'not available', hostname_length: 0, has_query: false }
+      let errorName = 'unknown'
+      let errorMessage = String(error)
+      if (error instanceof Error) {
+        errorName = error.name
+        errorMessage = error.message
+      }
+
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-skipped',
+        event_details: {
+          domain: item.url ? this.safeRegisteredDomain(item.url) : 'not available',
+          failed_step: failedStep,
+          error_name: errorName,
+          error_message: errorMessage,
+          url_length: item.url ? item.url.length : 0,
+          hostname_length: shape.hostname_length,
+          title_length: item.title ? item.title.length : 0,
+          scheme: shape.scheme,
+          has_query: shape.has_query,
+          visit_count: item.visitCount,
+          history_item_id: item.id,
+          date: Date.now()
+        }
+      })
+    } catch (diagnosticError) {
+      // A diagnostic must never become a new failure path.
+      console.error('[rex-history] Failed to emit rex-history-skipped diagnostic:', diagnosticError)
+    }
   }
 
   /**

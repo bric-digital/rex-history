@@ -37,7 +37,7 @@
     },
     "dependencies": {
         "@bric/rex-core": "github:bric-digital/rex-core",
-        "@bric/rex-lists": "github:bric-digital/rex-lists",
+        "@bric/rex-lists": "github:bric-digital/rex-lists#a9c38eb04072a224aaf6963d89989e4acbc8ef95",
         "@bric/rex-types": "github:bric-digital/rex-types",
         "@types/node": "^25.6.0",
         "psl": "^1.9.0"
