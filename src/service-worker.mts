@@ -21,6 +21,15 @@ interface HistoryConfig {
    * Set to 0 to disable joining. Default 5000 when unset.
    */
   page_events_link_tolerance_ms?: number;
+  /**
+   * Page size for the collection loop's chrome.history.search calls.
+   * This is a per-request page size, not a collection cap: the loop
+   * paginates by advancing a visit-time cursor until a page returns
+   * empty, so every record is collected regardless of this value.
+   * Smaller pages reduce per-request memory/latency in the service
+   * worker at the cost of more loop iterations. Default 1000 when unset.
+   */
+  collection_page_size?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +44,7 @@ interface HistoryConfig {
 
 const URL_ACTIVE_BUFFER_MAX = 256
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
+const DEFAULT_COLLECTION_PAGE_SIZE = 1000
 
 interface UrlActiveSeam {
   subscribe(listener: (event: RexPageUrlActiveEvent) => void): () => void
@@ -475,11 +485,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         lastProcessedVisitTime = initialLastFetch
         console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`)
 
+        const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
+
         const fetchHistoryBatch = (): Promise<void> => {
           return chrome.history.search({
             text: '',
             startTime: lastProcessedVisitTime,
-            maxResults: 10000
+            maxResults: pageSize
           }).then((historyItems) => {
             console.log(`[rex-history] Found ${historyItems.length} history items`)
             if (historyItems.length === 0) {
