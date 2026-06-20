@@ -30,6 +30,7 @@ This module reads from the `history` section of the backend config.
 | `enabled` | boolean | Yes | - | Enable/disable history collection |
 | `collection_interval_minutes` | number | No | 5 | How often to collect history (in minutes) |
 | `lookback_days` | number | No | 1 | How far back to query history |
+| `collection_page_size` | number | No | 1000 | Per-request page size for the collection loop's `chrome.history.search` calls. Not a collection cap: the loop paginates by visit-time cursor until a page is empty, so every record is still collected. Smaller pages reduce per-request memory/latency in the service worker at the cost of more iterations. |
 | `allow_lists` | string[] | No | [] | List names - only URLs matching these lists are collected. If empty, all URLs are collected. |
 | `filter_lists` | string[] | No | [] | List names - matching URLs have their URL replaced with category placeholder |
 | `category_lists` | string[] | No | [] | List names - used to attach category metadata to URLs |
