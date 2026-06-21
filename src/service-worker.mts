@@ -142,6 +142,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
+  private sleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), ms)
+    })
+  }
+
   /**
    * Find the most recent buffered url-active record matching the visit within
    * tolerance. Returns null when: no match, tolerance is 0, URL is redacted
@@ -466,9 +472,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return Promise.resolve()
       }
 
-      return new Promise<void>((resolve) => {
-        setTimeout(() => resolve(), 250)
-      })
+      return this.sleep(250)
         .then(() => this.loadConfiguration())
         .then(() => tryReload())
     }
@@ -541,7 +545,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           })
           return Promise.resolve()
         }
-        return new Promise<void>((resolve) => setTimeout(resolve, 1100))
+        return this.sleep(1100)
           .then(() => {
             dispatchEvent({
               name: 'pdk-app-event',
