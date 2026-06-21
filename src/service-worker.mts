@@ -376,15 +376,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       if (result.webmunkHistoryLastFetch) {
         return result.webmunkHistoryLastFetch as number
       }
-
-      // If no last fetch time, use lookback_days from config
-      if (this.config) {
-        const lookbackMs = this.config.lookback_days * 24 * 60 * 60 * 1000
-        return Date.now() - lookbackMs
-      }
-
-      // Default to 30 days ago
-      return Date.now() - (30 * 24 * 60 * 60 * 1000)
+      const lookbackDays = this.config?.lookback_days ?? 30
+      return Date.now() - lookbackDays * 24 * 60 * 60 * 1000
     } catch (error) {
       console.error('[rex-history] Failed to get last fetch time:', error)
       return Date.now() - (30 * 24 * 60 * 60 * 1000)
@@ -598,17 +591,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         // Extract registered domain from URL using psl
-        let registeredDomain = 'not available'
-        try {
-          const urlObj = new URL(item.url)
-          const hostname = urlObj.hostname
-          const parsed = psl.parse(hostname)
-          if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-            registeredDomain = parsed.domain
-          }
-        } catch {
-          // Keep default 'not available' for invalid URLs
-        }
+        let registeredDomain = this.safeRegisteredDomain(item.url)
 
         let recordedUrl = item.url
         let recordedTitle = item.title || ''
