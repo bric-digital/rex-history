@@ -558,6 +558,149 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       .then(() => this.saveStatus())
   }
 
+  private async resolveRecordedUrl(
+    url: string,
+    visit: chrome.history.VisitItem,
+    item: chrome.history.HistoryItem
+  ): Promise<{
+    recordedUrl: string;
+    recordedTitle: string;
+    registeredDomain: string;
+    filteredByList?: string;
+    filterMatch?: listUtils.ListEntry;
+    allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
+  }> {
+    const ctx = {
+      visit_id: visit.visitId,
+      visit_time: visit.visitTime,
+      history_item_id: item.id
+    }
+
+    let registeredDomain = this.safeRegisteredDomain(url)
+    // eslint-disable-next-line no-useless-assignment -- applyFilterLists returns url unchanged when no filter matches; this is the intended default
+    let recordedUrl = url
+    let recordedTitle = item.title || ''
+    let filteredByList: string | undefined
+    let filterMatch: listUtils.ListEntry | undefined
+
+    // Apply domain_only_lists FIRST: takes precedence over allow_lists.
+    // URLs on a domain_only_list are always collected at domain resolution,
+    // regardless of allow_list membership.
+    const domainOnlyResult = await this.applyDomainOnlyLists(url, ctx)
+
+    let allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry }
+
+    if (domainOnlyResult.filteredByList) {
+      recordedUrl = 'DOMAIN ONLY'
+      recordedTitle = 'DOMAIN ONLY'
+      filteredByList = domainOnlyResult.filteredByList
+      filterMatch = domainOnlyResult.filterMatch
+      allowCheck = { allowed: true }
+      // registeredDomain stays as-is (domain preserved — that's the point of domain_only)
+    } else {
+      // Apply allow_lists: if configured, only collect URLs matching an allow-list.
+      // If not allowed, create a dummy record (like blocklist behavior).
+      allowCheck = await this.checkAllowLists(url)
+
+      if (!allowCheck.allowed) {
+        // URL not on allowlist - create dummy record with category placeholder
+        recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
+        recordedTitle = ''
+        registeredDomain = ''
+        // Log debug event if enabled (dev-only)
+        await this.maybeLogFilteredUrlDebug(
+          url,
+          recordedUrl,
+          'NOT_ON_ALLOWLIST',
+          undefined,
+          ctx
+        )
+      } else {
+        // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
+        const filterResult = await this.applyFilterLists(url, ctx)
+        recordedUrl = filterResult.recordedUrl
+        filteredByList = filterResult.filteredByList
+        filterMatch = filterResult.filterMatch
+
+        // Privacy: if we masked the URL, mask the title and domain too.
+        if (recordedUrl.startsWith('CATEGORY:')) {
+          recordedTitle = ''
+          registeredDomain = ''
+        }
+      }
+    }
+
+    return { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck }
+  }
+
+  private buildVisitEvent(
+    item: chrome.history.HistoryItem,
+    visit: chrome.history.VisitItem,
+    resolved: {
+      recordedUrl: string;
+      recordedTitle: string;
+      registeredDomain: string;
+      filteredByList?: string;
+      filterMatch?: listUtils.ListEntry;
+      allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
+    },
+    categories: string[],
+    linkFields: Record<string, unknown>
+  ): Record<string, unknown> {
+    return {
+      name: 'rex-history-visit',
+      // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
+      url: resolved.recordedUrl,
+      recorded_url: resolved.recordedUrl,
+      domain: resolved.registeredDomain,
+      title: resolved.recordedTitle,
+      visit_time: visit.visitTime,
+      transition_type: visit.transition,
+      is_local: visit.isLocal,
+      categories: categories,
+      date: visit.visitTime,
+
+      // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
+      visit_id: visit.visitId,
+      referring_visit_id: visit.referringVisitId,
+
+      // URL-level history item fields (useful context, low cost)
+      history_item_id: item.id,
+      last_visit_time: item.lastVisitTime,
+      visit_count: item.visitCount,
+      typed_count: item.typedCount,
+
+      // Allow-list context (which list allowed this URL)
+      allowed_by_list: resolved.allowCheck.matchedList,
+      allowed_by_list_entry: resolved.allowCheck.matchEntry
+        ? {
+            list_name: resolved.allowCheck.matchedList,
+            matched_pattern: resolved.allowCheck.matchEntry.pattern,
+            matched_pattern_type: resolved.allowCheck.matchEntry.pattern_type,
+            matched_source: resolved.allowCheck.matchEntry.source,
+            matched_metadata: resolved.allowCheck.matchEntry.metadata || {}
+          }
+        : undefined,
+
+      // Filter-list context (safe: doesn't include original URL)
+      filtered: Boolean(resolved.filteredByList),
+      filtered_by_list: resolved.filteredByList,
+      filtered_by_list_entry: resolved.filterMatch
+        ? {
+            list_name: resolved.filteredByList,
+            matched_pattern: resolved.filterMatch.pattern,
+            matched_pattern_type: resolved.filterMatch.pattern_type,
+            matched_source: resolved.filterMatch.source,
+            matched_metadata: resolved.filterMatch.metadata || {}
+          }
+        : undefined,
+
+      // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
+      // Spread so these keys are simply absent when no match fired.
+      ...linkFields,
+    }
+  }
+
   private async processHistoryBatch(
     historyItems: chrome.history.HistoryItem[],
     lastFetch: number
@@ -590,73 +733,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           continue
         }
 
-        // Extract registered domain from URL using psl
-        let registeredDomain = this.safeRegisteredDomain(item.url)
-
-        let recordedUrl = item.url
-        let recordedTitle = item.title || ''
-        let filteredByList: string | undefined
-        let filterMatch: listUtils.ListEntry | undefined
-
-        // Apply domain_only_lists FIRST: takes precedence over allow_lists.
-        // URLs on a domain_only_list are always collected at domain resolution,
-        // regardless of allow_list membership.
         failedStep = 'list-matching'
-        const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
-          visit_id: visit.visitId,
-          visit_time: visit.visitTime,
-          history_item_id: item.id
-        })
-
-        let allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry }
-
-        if (domainOnlyResult.filteredByList) {
-          recordedUrl = 'DOMAIN ONLY'
-          recordedTitle = 'DOMAIN ONLY'
-          filteredByList = domainOnlyResult.filteredByList
-          filterMatch = domainOnlyResult.filterMatch
-          allowCheck = { allowed: true }
-          // registeredDomain stays as-is (domain preserved — that's the point of domain_only)
-        } else {
-          // Apply allow_lists: if configured, only collect URLs matching an allow-list.
-          // If not allowed, create a dummy record (like blocklist behavior).
-          allowCheck = await this.checkAllowLists(item.url)
-
-          if (!allowCheck.allowed) {
-            // URL not on allowlist - create dummy record with category placeholder
-            recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
-            recordedTitle = ''
-            registeredDomain = ''
-            // Log debug event if enabled (dev-only)
-            await this.maybeLogFilteredUrlDebug(
-              item.url,
-              recordedUrl,
-              'NOT_ON_ALLOWLIST',
-              undefined,
-              {
-                visit_id: visit.visitId,
-                visit_time: visit.visitTime,
-                history_item_id: item.id
-              }
-            )
-          } else {
-            // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
-            const filterResult = await this.applyFilterLists(item.url, {
-              visit_id: visit.visitId,
-              visit_time: visit.visitTime,
-              history_item_id: item.id
-            })
-            recordedUrl = filterResult.recordedUrl
-            filteredByList = filterResult.filteredByList
-            filterMatch = filterResult.filterMatch
-
-            // Privacy: if we masked the URL, mask the title and domain too.
-            if (recordedUrl.startsWith('CATEGORY:')) {
-              recordedTitle = ''
-              registeredDomain = ''
-            }
-          }
-        }
+        const resolved = await this.resolveRecordedUrl(item.url, visit, item)
 
         // Categorize against category lists
         failedStep = 'categorize'
@@ -668,8 +746,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // against accidentally un-redacting via linkage metadata. When the URL is
         // not redacted, we pass the raw URL to match against buffer records.
         // When rex-page-events isn't installed, the buffer is empty and this is a no-op.
-        const matchUrl = recordedUrl.startsWith('CATEGORY:') || recordedUrl === ''
-          ? recordedUrl
+        const matchUrl = resolved.recordedUrl.startsWith('CATEGORY:') || resolved.recordedUrl === ''
+          ? resolved.recordedUrl
           : item.url
         const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime)
         const linkFields = linkMatch !== null
@@ -684,58 +762,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // Dispatch event to all modules (PDK will pick it up for upload)
         failedStep = 'dispatch'
         console.log('[rex-history] Logging event: rex-history-visit')
-        dispatchEvent({
-          name: 'rex-history-visit',
-          // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
-          url: recordedUrl,
-          recorded_url: recordedUrl,
-          domain: registeredDomain,
-          title: recordedTitle,
-          visit_time: visit.visitTime,
-          transition_type: visit.transition,
-          is_local: visit.isLocal,
-          categories: categories,
-          date: visit.visitTime,
-
-          // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
-          visit_id: visit.visitId,
-          referring_visit_id: visit.referringVisitId,
-
-          // URL-level history item fields (useful context, low cost)
-          history_item_id: item.id,
-          last_visit_time: item.lastVisitTime,
-          visit_count: item.visitCount,
-          typed_count: item.typedCount,
-
-          // Allow-list context (which list allowed this URL)
-          allowed_by_list: allowCheck.matchedList,
-          allowed_by_list_entry: allowCheck.matchEntry
-            ? {
-                list_name: allowCheck.matchedList,
-                matched_pattern: allowCheck.matchEntry.pattern,
-                matched_pattern_type: allowCheck.matchEntry.pattern_type,
-                matched_source: allowCheck.matchEntry.source,
-                matched_metadata: allowCheck.matchEntry.metadata || {}
-              }
-            : undefined,
-
-          // Filter-list context (safe: doesn't include original URL)
-          filtered: Boolean(filteredByList),
-          filtered_by_list: filteredByList,
-          filtered_by_list_entry: filterMatch
-            ? {
-                list_name: filteredByList,
-                matched_pattern: filterMatch.pattern,
-                matched_pattern_type: filterMatch.pattern_type,
-                matched_source: filterMatch.source,
-                matched_metadata: filterMatch.metadata || {}
-              }
-            : undefined,
-
-          // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
-          // Spread so these keys are simply absent when no match fired.
-          ...linkFields,
-        })
+        dispatchEvent(this.buildVisitEvent(item, visit, resolved, categories, linkFields))
 
         collectedCount++
       }
