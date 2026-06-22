@@ -394,15 +394,15 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
-  collectHistory(): Promise<void> {
+  async collectHistory(): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
-      return Promise.resolve()
+      return
     }
 
     if (!this.status.listsReady) {
       console.log('[rex-history] Lists not yet synced, skipping collection')
-      return Promise.resolve()
+      return
     }
 
     // Set the flag synchronously BEFORE any async work so that concurrent
@@ -410,45 +410,41 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     // immediately and skip the destructive parseAndSyncLists cycle.
     this.status.isCollecting = true
 
-    // IMPORTANT: Do not collect or send data until user has entered an identifier
-    return this.hasIdentifier()
-      .then((hasIdentifier) => {
-        if (!hasIdentifier) {
-          console.warn('[rex-history] No identifier set - collection will not start until identifier is provided')
-          return Promise.reject(new Error('NO_IDENTIFIER'))
-        }
-        // Full loadConfiguration (with list sync) is safe here because
-        // isCollecting is already true, which prevents the storage.onChanged
-        // listener from starting a concurrent list sync.
-        return this.loadConfiguration()
-      })
-      .then(() => this.waitForConfiguration())
-      .then(() => {
-        if (!this.config) {
-          console.warn('[rex-history] No configuration available, skipping collection')
-          return Promise.reject(new Error('NO_CONFIGURATION'))
-        }
+    try {
+      // IMPORTANT: Do not collect or send data until user has entered an identifier
+      const hasIdentifier = await this.hasIdentifier()
+      if (!hasIdentifier) {
+        console.warn('[rex-history] No identifier set - collection will not start until identifier is provided')
+        throw new Error('NO_IDENTIFIER')
+      }
 
-        console.log('[rex-history] Starting history collection')
-        return this.saveStatus()
-      })
-      .then(() => this.runCollectionCycle())
-      .catch((error: unknown) => {
-        if (error instanceof Error && (error.message === 'NO_IDENTIFIER' || error.message === 'NO_CONFIGURATION')) {
-          return
-        }
+      // Full loadConfiguration (with list sync) is safe here because
+      // isCollecting is already true, which prevents the storage.onChanged
+      // listener from starting a concurrent list sync.
+      await this.loadConfiguration()
+      await this.waitForConfiguration()
 
-        console.error('[rex-history] Collection error:', error)
-        // Even on failure, record that we attempted a fetch so operators/tests can
-        // see activity and avoid "undefined" last-fetch state.
-        return this.setLastFetchTime(Date.now())
-      })
-      .finally(() => {
-        this.status.isCollecting = false
-        return this.saveStatus().finally(() => {
-          console.log('[rex-history] Collection complete')
-        })
-      })
+      if (!this.config) {
+        console.warn('[rex-history] No configuration available, skipping collection')
+        throw new Error('NO_CONFIGURATION')
+      }
+
+      console.log('[rex-history] Starting history collection')
+      await this.saveStatus()
+      await this.runCollectionCycle()
+    } catch (error: unknown) {
+      if (error instanceof Error && (error.message === 'NO_IDENTIFIER' || error.message === 'NO_CONFIGURATION')) {
+        return
+      }
+      console.error('[rex-history] Collection error:', error)
+      // Even on failure, record that we attempted a fetch so operators/tests can
+      // see activity and avoid "undefined" last-fetch state.
+      await this.setLastFetchTime(Date.now())
+    } finally {
+      this.status.isCollecting = false
+      await this.saveStatus()
+      console.log('[rex-history] Collection complete')
+    }
   }
 
   private async waitForConfiguration(): Promise<void> {
