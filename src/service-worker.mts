@@ -539,7 +539,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
 
     let registeredDomain = this.safeRegisteredDomain(url)
-    // eslint-disable-next-line no-useless-assignment -- applyFilterLists returns url unchanged when no filter matches; this is the intended default
+    // eslint-disable-next-line no-useless-assignment -- placates static analysis: every branch below reassigns recordedUrl before it is read, but the `= url` initializer documents the unfiltered default (applyFilterLists returns url unchanged on no match)
     let recordedUrl = url
     let recordedTitle = item.title || ''
     let filteredByList: string | undefined

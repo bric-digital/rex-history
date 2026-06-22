@@ -144,3 +144,5 @@ playwright-report/
 playwright/.cache/
 tests/src/build/
 tests/extension/service-worker.bundle.js
+# Agent plan/spec scratchpads — never commit
+docs/superpowers/
