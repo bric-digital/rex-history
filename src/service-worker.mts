@@ -451,26 +451,14 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       })
   }
 
-  private waitForConfiguration(): Promise<void> {
-    if (this.config) {
-      return Promise.resolve()
-    }
+  private async waitForConfiguration(): Promise<void> {
+    if (this.config) return
 
     const deadlineMs = Date.now() + 1500
-    const tryReload = (): Promise<void> => {
-      if (this.config) {
-        return Promise.resolve()
-      }
-      if (Date.now() >= deadlineMs) {
-        return Promise.resolve()
-      }
-
-      return this.sleep(250)
-        .then(() => this.loadConfiguration())
-        .then(() => tryReload())
+    while (!this.config && Date.now() < deadlineMs) {
+      await this.sleep(250)
+      await this.loadConfiguration()
     }
-
-    return tryReload()
   }
 
   private runCollectionCycle(): Promise<void> {
