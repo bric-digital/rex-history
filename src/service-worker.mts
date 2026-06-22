@@ -461,89 +461,67 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
-  private runCollectionCycle(): Promise<void> {
+  private async runCollectionCycle(): Promise<void> {
     let collectedCount = 0
-    let lastProcessedVisitTime = 0
+    let lastProcessedVisitTime = await this.getLastFetchTime()
+    console.log(`[rex-history] Fetching history since ${new Date(lastProcessedVisitTime).toISOString()}`)
 
-    return this.getLastFetchTime()
-      .then((initialLastFetch) => {
-        lastProcessedVisitTime = initialLastFetch
-        console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`)
+    const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
-        const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
+    while (true) {
+      const historyItems = await chrome.history.search({
+        text: '', startTime: lastProcessedVisitTime, maxResults: pageSize
+      })
+      console.log(`[rex-history] Found ${historyItems.length} history items`)
+      if (historyItems.length === 0) break
 
-        const fetchHistoryBatch = (): Promise<void> => {
-          return chrome.history.search({
-            text: '',
-            startTime: lastProcessedVisitTime,
-            maxResults: pageSize
-          }).then((historyItems) => {
-            console.log(`[rex-history] Found ${historyItems.length} history items`)
-            if (historyItems.length === 0) {
-              return
-            }
+      const batchResult = await this.processHistoryBatch(historyItems, lastProcessedVisitTime)
+      collectedCount += batchResult.collectedCount
+      if (batchResult.maxVisitTime <= lastProcessedVisitTime) break
+      // Advance cursor so the next fetch only looks for newer visits.
+      lastProcessedVisitTime = batchResult.maxVisitTime + 1
+    }
 
-            return this.processHistoryBatch(historyItems, lastProcessedVisitTime)
-              .then((batchResult) => {
-                collectedCount += batchResult.collectedCount
-                if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
-                  return
-                }
-                // Advance cursor so the next fetch only looks for newer visits.
-                lastProcessedVisitTime = batchResult.maxVisitTime + 1
-                return fetchHistoryBatch()
-              })
-          })
+    console.log(`[rex-history] Collected ${collectedCount} history visits`)
+    if (this.config?.generate_top_domains) {
+      await this.generateTopDomainsList()
+    }
+
+    // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
+    // has elapsed since the last persist.  When multiple history events
+    // are dispatched in quick succession, only the first triggers a
+    // persist; later events stay in PDK's in-memory queue.  Dispatching
+    // a lightweight summary event after a short delay ensures the
+    // persist debounce has expired, so PDK flushes the entire queue.
+    // When no items were collected we still need to dispatch the
+    // completion event so callers (e.g. offboarding) know history
+    // collection finished.  Skip the 1.1s PDK-debounce delay since
+    // there is nothing queued to flush.
+    if (collectedCount === 0) {
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-complete',
+        event_details: {
+          collected_count: 0,
+          date: Date.now()
         }
+      })
+    } else {
+      await this.sleep(1100)
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-complete',
+        event_details: {
+          collected_count: collectedCount,
+          date: Date.now()
+        }
+      })
+    }
 
-        return fetchHistoryBatch()
-      })
-      .then(() => {
-        console.log(`[rex-history] Collected ${collectedCount} history visits`)
-        if (this.config?.generate_top_domains) {
-          return this.generateTopDomainsList()
-        }
-      })
-      .then(() => {
-        // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
-        // has elapsed since the last persist.  When multiple history events
-        // are dispatched in quick succession, only the first triggers a
-        // persist; later events stay in PDK's in-memory queue.  Dispatching
-        // a lightweight summary event after a short delay ensures the
-        // persist debounce has expired, so PDK flushes the entire queue.
-        // When no items were collected we still need to dispatch the
-        // completion event so callers (e.g. offboarding) know history
-        // collection finished.  Skip the 1.1s PDK-debounce delay since
-        // there is nothing queued to flush.
-        if (collectedCount === 0) {
-          dispatchEvent({
-            name: 'pdk-app-event',
-            event_name: 'rex-history-collection-complete',
-            event_details: {
-              collected_count: 0,
-              date: Date.now()
-            }
-          })
-          return Promise.resolve()
-        }
-        return this.sleep(1100)
-          .then(() => {
-            dispatchEvent({
-              name: 'pdk-app-event',
-              event_name: 'rex-history-collection-complete',
-              event_details: {
-                collected_count: collectedCount,
-                date: Date.now()
-              }
-            })
-          })
-      })
-      .then(() => {
-        this.status.lastCollectionTime = Date.now()
-        this.status.itemsCollected += collectedCount
-        return this.setLastFetchTime(lastProcessedVisitTime)
-      })
-      .then(() => this.saveStatus())
+    this.status.lastCollectionTime = Date.now()
+    this.status.itemsCollected += collectedCount
+    await this.setLastFetchTime(lastProcessedVisitTime)
+    await this.saveStatus()
   }
 
   private async resolveRecordedUrl(
