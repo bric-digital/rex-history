@@ -1,5 +1,5 @@
 import psl from 'psl'
-import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent, type EventPayload } from '@bric/rex-core/service-worker'
 import type { REXConfiguration } from '@bric/rex-core/common'
 import * as listUtils from '@bric/rex-lists'
 import { type RexPageUrlActiveEvent } from '@bric/rex-types/types'
@@ -62,6 +62,15 @@ interface HistoryStatus {
   listsReady?: boolean;
   configSource?: 'server' | 'none';
   effectiveConfig?: HistoryConfig;
+}
+
+interface ResolvedRecordedUrl {
+  recordedUrl: string;
+  recordedTitle: string;
+  registeredDomain: string;
+  filteredByList?: string | undefined;
+  filterMatch?: listUtils.ListEntry | undefined;
+  allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
 }
 
 /**
@@ -524,18 +533,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     url: string,
     visit: chrome.history.VisitItem,
     item: chrome.history.HistoryItem
-  ): Promise<{
-    recordedUrl: string;
-    recordedTitle: string;
-    registeredDomain: string;
-    filteredByList?: string;
-    filterMatch?: listUtils.ListEntry;
-    allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
-  }> {
-    const ctx = {
+  ): Promise<ResolvedRecordedUrl> {
+    const ctx: { visit_id?: string; visit_time?: number; history_item_id?: string } = {
       visit_id: visit.visitId,
-      visit_time: visit.visitTime,
       history_item_id: item.id
+    }
+    // The caller only invokes resolveRecordedUrl for visits that passed its
+    // `!visit.visitTime` guard, so visitTime is defined here. Assign only when
+    // present so the optional property is omitted rather than set to undefined
+    // (exactOptionalPropertyTypes distinguishes the two).
+    if (visit.visitTime !== undefined) {
+      ctx.visit_time = visit.visitTime
     }
 
     let registeredDomain = this.safeRegisteredDomain(url)
@@ -598,17 +606,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   private buildVisitEvent(
     item: chrome.history.HistoryItem,
     visit: chrome.history.VisitItem,
-    resolved: {
-      recordedUrl: string;
-      recordedTitle: string;
-      registeredDomain: string;
-      filteredByList?: string;
-      filterMatch?: listUtils.ListEntry;
-      allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
-    },
+    resolved: ResolvedRecordedUrl,
     categories: string[],
     linkFields: Record<string, unknown>
-  ): Record<string, unknown> {
+  ): EventPayload {
     return {
       name: 'rex-history-visit',
       // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
