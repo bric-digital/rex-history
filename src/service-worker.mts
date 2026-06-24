@@ -473,7 +473,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
     const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
+    let durableCursor = lastProcessedVisitTime
+
     while (true) {
+      // Persist the PREVIOUS batch's cursor before fetching the next page. That
+      // batch's data points have had a full fetch+process cycle to clear PDK's
+      // ~1s persist debounce, so resuming past them cannot lose data. Lagging
+      // the durable cursor one batch behind the in-memory one means a service
+      // worker killed mid-walk resumes where it left off instead of re-walking
+      // from scratch on the next alarm (the cause of endless re-submission with
+      // no rex-history-collection-complete on heavy histories).
+      await this.setLastFetchTime(durableCursor)
       const historyItems = await chrome.history.search({
         text: '', startTime: lastProcessedVisitTime, maxResults: pageSize
       })
@@ -485,6 +495,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       if (batchResult.maxVisitTime <= lastProcessedVisitTime) break
       // Advance cursor so the next fetch only looks for newer visits.
       lastProcessedVisitTime = batchResult.maxVisitTime + 1
+      durableCursor = lastProcessedVisitTime
     }
 
     console.log(`[rex-history] Collected ${collectedCount} history visits`)
