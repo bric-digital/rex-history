@@ -487,31 +487,41 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
         const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
-        const fetchHistoryBatch = (): Promise<void> => {
-          return chrome.history.search({
-            text: '',
-            startTime: lastProcessedVisitTime,
-            maxResults: pageSize
-          }).then((historyItems) => {
-            console.log(`[rex-history] Found ${historyItems.length} history items`)
-            if (historyItems.length === 0) {
-              return
-            }
+        const fetchHistoryBatch = (durableCursor: number): Promise<void> => {
+          // Persist the PREVIOUS batch's cursor before fetching the next page.
+          // That batch's data points have had a full fetch+process cycle to
+          // clear PDK's ~1s persist debounce, so resuming past them cannot lose
+          // data. Lagging the durable cursor one batch behind the in-memory one
+          // means a service worker killed mid-walk resumes where it left off
+          // instead of re-walking from scratch on the next alarm (the cause of
+          // endless re-submission with no rex-history-collection-complete on
+          // heavy histories).
+          return this.setLastFetchTime(durableCursor)
+            .then(() => chrome.history.search({
+              text: '',
+              startTime: lastProcessedVisitTime,
+              maxResults: pageSize
+            }))
+            .then((historyItems) => {
+              console.log(`[rex-history] Found ${historyItems.length} history items`)
+              if (historyItems.length === 0) {
+                return
+              }
 
-            return this.processHistoryBatch(historyItems, lastProcessedVisitTime)
-              .then((batchResult) => {
-                collectedCount += batchResult.collectedCount
-                if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
-                  return
-                }
-                // Advance cursor so the next fetch only looks for newer visits.
-                lastProcessedVisitTime = batchResult.maxVisitTime + 1
-                return fetchHistoryBatch()
-              })
-          })
+              return this.processHistoryBatch(historyItems, lastProcessedVisitTime)
+                .then((batchResult) => {
+                  collectedCount += batchResult.collectedCount
+                  if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
+                    return
+                  }
+                  // Advance cursor so the next fetch only looks for newer visits.
+                  lastProcessedVisitTime = batchResult.maxVisitTime + 1
+                  return fetchHistoryBatch(lastProcessedVisitTime)
+                })
+            })
         }
 
-        return fetchHistoryBatch()
+        return fetchHistoryBatch(lastProcessedVisitTime)
       })
       .then(() => {
         console.log(`[rex-history] Collected ${collectedCount} history visits`)
