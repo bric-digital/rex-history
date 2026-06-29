@@ -512,6 +512,20 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
                 .then((batchResult) => {
                   collectedCount += batchResult.collectedCount
                   if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
+                    // No visit in this page was newer than the cursor. If the
+                    // page was capped (>= pageSize items), more items may share
+                    // this exact timestamp than fit in one page — every fetch
+                    // returns the same un-advancing page and the walk wedges
+                    // here forever (never completing, starving newer visits
+                    // behind the cluster). Step the cursor 1ms past the stuck
+                    // timestamp to clear the cluster. Visits at exactly the old
+                    // cursor were already collected on the prior cycle, so this
+                    // loses no data. A non-full page genuinely means nothing
+                    // newer remains, so exit.
+                    if (historyItems.length >= pageSize) {
+                      lastProcessedVisitTime = lastProcessedVisitTime + 1
+                      return fetchHistoryBatch(lastProcessedVisitTime)
+                    }
                     return
                   }
                   // Advance cursor so the next fetch only looks for newer visits.
