@@ -1104,3 +1104,79 @@ test.describe('HistoryServiceWorkerModule — Stranded isCollecting flag (Defect
     expect(collectingAfterLoad).toBe(false)
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Cursor non-advance at same-timestamp boundary', () => {
+  /**
+   * Reproduces the 1.3.10 field wedge: the durable cursor freezes at a
+   * timestamp shared by more than `collection_page_size` history items.
+   *
+   * After a successful cycle the durable cursor is persisted as the last
+   * collected visit time (exact, not +1). The next cycle fetches items with
+   * lastVisitTime >= cursor; processHistoryBatch skips every visit whose time
+   * is <= the cursor, so maxVisitTime never advances past the boundary. The
+   * walk exits with the cursor unmoved, and every subsequent alarm re-fetches
+   * the identical page — collecting nothing, never emitting completion, and
+   * starving any genuinely newer visit that sits behind the boundary cluster.
+   *
+   * The fix: when a non-empty page yields no cursor advance, step the cursor
+   * one ms past the stuck timestamp so the next fetch clears the cluster.
+   * Visits at exactly the old cursor were already collected on the prior cycle
+   * (that is what the cursor records), so stepping +1 loses no data.
+   */
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    // Page size of 2 makes a 3-item same-timestamp cluster overflow one page.
+    await seedConfigAndIdentifier(page, { collection_page_size: 2 })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('cursor advances past a same-timestamp cluster larger than the page', async ({ page }) => {
+    const boundary = Date.now() - 100_000
+
+    // Pre-seed the durable cursor exactly at the boundary, as a prior cycle
+    // would have left it after collecting visits at `boundary`.
+    await page.evaluate(async (boundary) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = boundary
+      await window.chrome.storage.local.set(data)
+    }, boundary)
+
+    // Three items all visited at exactly `boundary` — one page (size 2) cannot
+    // hold them, and none advance maxVisitTime since their time == cursor.
+    await addHistoryItem(page, 'https://a.example.com', 'A', boundary)
+    await addHistoryItem(page, 'https://b.example.com', 'B', boundary)
+    await addHistoryItem(page, 'https://c.example.com', 'C', boundary)
+    // A genuinely newer visit that sits behind the boundary cluster. A wedged
+    // cursor never reaches it; a healed cursor must collect it.
+    await addHistoryItem(page, 'https://newer.example.com', 'Newer', boundary + 5_000)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const cursorAfter = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Wedge: cursor stays == boundary. Fixed: it moves past the cluster.
+    expect(cursorAfter).toBeGreaterThan(boundary)
+
+    const visitUrls = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[])
+          .filter((e) => e.name === 'rex-history-visit')
+          .map((e) => e.url as string)
+    )
+    // The newer visit behind the cluster must be collected once the cursor clears.
+    expect(visitUrls).toContain('https://newer.example.com')
+  })
+})

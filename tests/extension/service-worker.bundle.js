@@ -10350,6 +10350,28 @@ var oa = (e) => {
 var na = { parse: O, get: aa, isValid: oa };
 
 // node_modules/@bric/rex-lists/src/list-utilities.mts
+var LISTS_HASH_STORAGE_KEY = "rexListsLastSyncedHash";
+async function hashListsConfig(listsConfig) {
+  const sorted = {};
+  for (const key of Object.keys(listsConfig).sort()) {
+    sorted[key] = listsConfig[key];
+  }
+  const encoded = new TextEncoder().encode(JSON.stringify(sorted));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function getLastSyncedListsHash() {
+  try {
+    const result = await globalThis.chrome.storage.local.get(LISTS_HASH_STORAGE_KEY);
+    const value = result[LISTS_HASH_STORAGE_KEY];
+    return typeof value === "string" ? value : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function setLastSyncedListsHash(hash) {
+  await globalThis.chrome.storage.local.set({ [LISTS_HASH_STORAGE_KEY]: hash });
+}
 var debugEnabled = false;
 function normalizeLeadingWww(host) {
   return host.toLowerCase().replace(/^www\./, "");
@@ -10453,6 +10475,21 @@ async function getListEntries(listName) {
     };
   });
 }
+async function hasListEntries(listName) {
+  const db = await getDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const index = store.index("list_name");
+    const request = index.count(listName);
+    request.onsuccess = () => {
+      resolve(request.result > 0);
+    };
+    request.onerror = () => {
+      reject(new Error(`Failed to count list entries: ${request.error?.message}`));
+    };
+  });
+}
 async function deleteAllEntriesInList(listName, sourceFilter) {
   const db = await getDatabase();
   return new Promise((resolve, reject) => {
@@ -10514,7 +10551,10 @@ async function matchDomainAgainstList(url, listName) {
     console.log(`[rex-lists] matchDomainAgainstList`);
     console.log(entries);
   }
-  for (const entry of entries) {
+  const sorted = [...entries].sort(
+    (a, b) => (PATTERN_TYPE_PRIORITY[a.pattern_type] ?? 99) - (PATTERN_TYPE_PRIORITY[b.pattern_type] ?? 99)
+  );
+  for (const entry of sorted) {
     if (matchesPattern(url, entry.pattern, entry.pattern_type)) {
       return entry;
     }
@@ -10614,9 +10654,19 @@ async function bulkDeleteListEntries(ids) {
     });
   });
 }
-async function parseAndSyncLists(listsConfig) {
+async function parseAndSyncLists(listsConfig, options) {
+  if (!options?.force) {
+    const newHash2 = await hashListsConfig(listsConfig);
+    const storedHash = await getLastSyncedListsHash();
+    if (storedHash !== void 0 && storedHash === newHash2) {
+      console.log("[list-utilities] Lists config unchanged, skipping sync");
+      return;
+    }
+  }
   const listNames = Object.keys(listsConfig);
   console.log(`[list-utilities] Syncing ${listNames.length} lists`);
+  let anyError = false;
+  const newHash = await hashListsConfig(listsConfig);
   for (const listName of listNames) {
     const entries = listsConfig[listName];
     if (!Array.isArray(entries)) {
@@ -10627,8 +10677,12 @@ async function parseAndSyncLists(listsConfig) {
       await mergeBackendList(listName, entries);
       console.log(`[list-utilities] Synced list: ${listName} (${entries.length} entries)`);
     } catch (error) {
+      anyError = true;
       console.error(`[list-utilities] Failed to sync list ${listName}:`, error);
     }
+  }
+  if (!anyError) {
+    await setLastSyncedListsHash(newHash);
   }
 }
 async function mergeBackendList(listName, entries) {
@@ -10664,7 +10718,7 @@ async function mergeBackendList(listName, entries) {
       console.log(`[list-utilities] Deleted ${entriesToDelete.length} conflicting entries for ${listName}`);
     } catch (error) {
       console.error(`[list-utilities] Failed to delete conflicting entries:`, error);
-      throw new Error(`Failed to clear conflicts before sync: ${error instanceof Error ? error.message : "unknown"}`, { cause: error });
+      throw new Error(`Failed to clear conflicts before sync: ${error instanceof Error ? error.message : "unknown"}`);
     }
   }
   const newEntries = [];
@@ -10697,6 +10751,14 @@ async function mergeBackendList(listName, entries) {
     console.log(`[list-utilities] Inserted ${newEntries.length} backend entries for: ${listName}`);
   }
 }
+var PATTERN_TYPE_PRIORITY = {
+  exact_url: 0,
+  regex: 1,
+  host_path_prefix: 2,
+  subdomain_wildcard: 3,
+  host: 3,
+  domain: 4
+};
 function matchesPattern(url, pattern, patternType) {
   try {
     const urlObj = new URL(url);
@@ -10791,6 +10853,7 @@ function matchesPattern(url, pattern, patternType) {
 // src/service-worker.mts
 var URL_ACTIVE_BUFFER_MAX = 256;
 var DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5e3;
+var DEFAULT_COLLECTION_PAGE_SIZE = 1e3;
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
 }
@@ -10914,6 +10977,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         });
       }
     });
+    await this.loadStatus();
     await this.loadConfiguration();
     const hasIdentifier = await this.hasIdentifier();
     if (this.config && hasIdentifier) {
@@ -10930,8 +10994,6 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         });
       }
     });
-    await this.loadStatus();
-    await this.loadConfiguration();
   }
   async loadConfiguration() {
     if (this.loadConfigurationPromise) {
@@ -10978,6 +11040,16 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         await parseAndSyncLists(listConfig);
         console.log("[rex-history] Lists synced.");
       }
+      const allowLists = this.config?.allow_lists;
+      if (!allowLists || allowLists.length === 0) {
+        this.status.listsReady = true;
+      } else {
+        const checks = await Promise.all(allowLists.map((name) => hasListEntries(name)));
+        if (checks.some(Boolean)) {
+          this.status.listsReady = true;
+        }
+      }
+      await this.saveStatus();
     } catch (error) {
       console.error("[rex-history] Failed to load configuration:", error);
     }
@@ -10999,6 +11071,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     } catch (error) {
       console.error("[rex-history] Failed to load status:", error);
     }
+    this.status.isCollecting = false;
   }
   async saveStatus() {
     try {
@@ -11037,6 +11110,10 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
   collectHistory() {
     if (this.status.isCollecting) {
       console.log("[rex-history] Collection already in progress, skipping");
+      return Promise.resolve();
+    }
+    if (!this.status.listsReady) {
+      console.log("[rex-history] Lists not yet synced, skipping collection");
       return Promise.resolve();
     }
     this.status.isCollecting = true;
@@ -11090,12 +11167,13 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     return this.getLastFetchTime().then((initialLastFetch) => {
       lastProcessedVisitTime = initialLastFetch;
       console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`);
-      const fetchHistoryBatch = () => {
-        return globalThis.chrome.history.search({
+      const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE;
+      const fetchHistoryBatch = (durableCursor) => {
+        return this.setLastFetchTime(durableCursor).then(() => globalThis.chrome.history.search({
           text: "",
           startTime: lastProcessedVisitTime,
-          maxResults: 1e4
-        }).then((historyItems) => {
+          maxResults: pageSize
+        })).then((historyItems) => {
           console.log(`[rex-history] Found ${historyItems.length} history items`);
           if (historyItems.length === 0) {
             return;
@@ -11103,14 +11181,18 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           return this.processHistoryBatch(historyItems, lastProcessedVisitTime).then((batchResult) => {
             collectedCount += batchResult.collectedCount;
             if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
+              if (historyItems.length >= pageSize) {
+                lastProcessedVisitTime = lastProcessedVisitTime + 1;
+                return fetchHistoryBatch(lastProcessedVisitTime);
+              }
               return;
             }
             lastProcessedVisitTime = batchResult.maxVisitTime + 1;
-            return fetchHistoryBatch();
+            return fetchHistoryBatch(lastProcessedVisitTime);
           });
         });
       };
-      return fetchHistoryBatch();
+      return fetchHistoryBatch(lastProcessedVisitTime);
     }).then(() => {
       console.log(`[rex-history] Collected ${collectedCount} history visits`);
       if (this.config?.generate_top_domains) {
@@ -11149,128 +11231,210 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     let maxVisitTime = lastFetch;
     for (const item of historyItems) {
       if (!item.url) continue;
-      const visits = await globalThis.chrome.history.getVisits({ url: item.url });
-      for (const visit of visits) {
-        if (!visit.visitTime || visit.visitTime <= lastFetch) continue;
-        maxVisitTime = Math.max(maxVisitTime, visit.visitTime);
-        if (this.shouldSkipUrl(item.url)) {
-          continue;
-        }
-        let registeredDomain = "not available";
-        try {
-          const urlObj = new URL(item.url);
-          const hostname = urlObj.hostname;
-          const parsed = na.parse(hostname);
-          if (parsed.error === void 0 && "domain" in parsed && parsed.domain) {
-            registeredDomain = parsed.domain;
+      let failedStep = "getVisits";
+      try {
+        const visits = await globalThis.chrome.history.getVisits({ url: item.url });
+        for (const visit of visits) {
+          if (!visit.visitTime || visit.visitTime <= lastFetch) continue;
+          maxVisitTime = Math.max(maxVisitTime, visit.visitTime);
+          if (this.shouldSkipUrl(item.url)) {
+            continue;
           }
-        } catch {
-        }
-        let recordedUrl = item.url;
-        let recordedTitle = item.title || "";
-        let filteredByList;
-        let filterMatch;
-        const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
-          visit_id: visit.visitId,
-          visit_time: visit.visitTime,
-          history_item_id: item.id
-        });
-        let allowCheck;
-        if (domainOnlyResult.filteredByList) {
-          recordedUrl = "DOMAIN ONLY";
-          recordedTitle = "DOMAIN ONLY";
-          filteredByList = domainOnlyResult.filteredByList;
-          filterMatch = domainOnlyResult.filterMatch;
-          allowCheck = { allowed: true };
-        } else {
-          allowCheck = await this.checkAllowLists(item.url);
-          if (!allowCheck.allowed) {
-            recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
-            recordedTitle = "";
-            registeredDomain = "";
-            await this.maybeLogFilteredUrlDebug(
-              item.url,
-              recordedUrl,
-              "NOT_ON_ALLOWLIST",
-              void 0,
-              {
+          let registeredDomain = "not available";
+          try {
+            const urlObj = new URL(item.url);
+            const hostname = urlObj.hostname;
+            const parsed = na.parse(hostname);
+            if (parsed.error === void 0 && "domain" in parsed && parsed.domain) {
+              registeredDomain = parsed.domain;
+            }
+          } catch {
+          }
+          let recordedUrl = item.url;
+          let recordedTitle = item.title || "";
+          let filteredByList;
+          let filterMatch;
+          failedStep = "list-matching";
+          const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
+            visit_id: visit.visitId,
+            visit_time: visit.visitTime,
+            history_item_id: item.id
+          });
+          let allowCheck;
+          if (domainOnlyResult.filteredByList) {
+            recordedUrl = "DOMAIN ONLY";
+            recordedTitle = "DOMAIN ONLY";
+            filteredByList = domainOnlyResult.filteredByList;
+            filterMatch = domainOnlyResult.filterMatch;
+            allowCheck = { allowed: true };
+          } else {
+            allowCheck = await this.checkAllowLists(item.url);
+            if (!allowCheck.allowed) {
+              recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
+              recordedTitle = "";
+              registeredDomain = "";
+              await this.maybeLogFilteredUrlDebug(
+                item.url,
+                recordedUrl,
+                "NOT_ON_ALLOWLIST",
+                void 0,
+                {
+                  visit_id: visit.visitId,
+                  visit_time: visit.visitTime,
+                  history_item_id: item.id
+                }
+              );
+            } else {
+              const filterResult = await this.applyFilterLists(item.url, {
                 visit_id: visit.visitId,
                 visit_time: visit.visitTime,
                 history_item_id: item.id
+              });
+              recordedUrl = filterResult.recordedUrl;
+              filteredByList = filterResult.filteredByList;
+              filterMatch = filterResult.filterMatch;
+              if (recordedUrl.startsWith("CATEGORY:")) {
+                recordedTitle = "";
+                registeredDomain = "";
               }
-            );
-          } else {
-            const filterResult = await this.applyFilterLists(item.url, {
-              visit_id: visit.visitId,
-              visit_time: visit.visitTime,
-              history_item_id: item.id
-            });
-            recordedUrl = filterResult.recordedUrl;
-            filteredByList = filterResult.filteredByList;
-            filterMatch = filterResult.filterMatch;
-            if (recordedUrl.startsWith("CATEGORY:")) {
-              recordedTitle = "";
-              registeredDomain = "";
             }
           }
+          failedStep = "categorize";
+          const categories = await this.categorizeUrl(item.url);
+          const matchUrl = recordedUrl.startsWith("CATEGORY:") || recordedUrl === "" ? recordedUrl : item.url;
+          const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime);
+          const linkFields = linkMatch !== null ? {
+            tab_id: linkMatch.tab_id,
+            window_id: linkMatch.window_id,
+            session_id: linkMatch.session_id,
+            page_events_url_shown_at: linkMatch.url_shown_at
+          } : {};
+          failedStep = "dispatch";
+          console.log("[rex-history] Logging event: rex-history-visit");
+          dispatchEvent({
+            name: "rex-history-visit",
+            // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
+            url: recordedUrl,
+            recorded_url: recordedUrl,
+            domain: registeredDomain,
+            title: recordedTitle,
+            visit_time: visit.visitTime,
+            transition_type: visit.transition,
+            is_local: visit.isLocal,
+            categories,
+            date: visit.visitTime,
+            // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
+            visit_id: visit.visitId,
+            referring_visit_id: visit.referringVisitId,
+            // URL-level history item fields (useful context, low cost)
+            history_item_id: item.id,
+            last_visit_time: item.lastVisitTime,
+            visit_count: item.visitCount,
+            typed_count: item.typedCount,
+            // Allow-list context (which list allowed this URL)
+            allowed_by_list: allowCheck.matchedList,
+            allowed_by_list_entry: allowCheck.matchEntry ? {
+              list_name: allowCheck.matchedList,
+              matched_pattern: allowCheck.matchEntry.pattern,
+              matched_pattern_type: allowCheck.matchEntry.pattern_type,
+              matched_source: allowCheck.matchEntry.source,
+              matched_metadata: allowCheck.matchEntry.metadata || {}
+            } : void 0,
+            // Filter-list context (safe: doesn't include original URL)
+            filtered: Boolean(filteredByList),
+            filtered_by_list: filteredByList,
+            filtered_by_list_entry: filterMatch ? {
+              list_name: filteredByList,
+              matched_pattern: filterMatch.pattern,
+              matched_pattern_type: filterMatch.pattern_type,
+              matched_source: filterMatch.source,
+              matched_metadata: filterMatch.metadata || {}
+            } : void 0,
+            // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
+            // Spread so these keys are simply absent when no match fired.
+            ...linkFields
+          });
+          collectedCount++;
         }
-        const categories = await this.categorizeUrl(item.url);
-        const matchUrl = recordedUrl.startsWith("CATEGORY:") || recordedUrl === "" ? recordedUrl : item.url;
-        const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime);
-        const linkFields = linkMatch !== null ? {
-          tab_id: linkMatch.tab_id,
-          window_id: linkMatch.window_id,
-          session_id: linkMatch.session_id,
-          page_events_url_shown_at: linkMatch.url_shown_at
-        } : {};
-        console.log("[rex-history] Logging event: rex-history-visit");
-        dispatchEvent({
-          name: "rex-history-visit",
-          // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
-          url: recordedUrl,
-          recorded_url: recordedUrl,
-          domain: registeredDomain,
-          title: recordedTitle,
-          visit_time: visit.visitTime,
-          transition_type: visit.transition,
-          is_local: visit.isLocal,
-          categories,
-          date: visit.visitTime,
-          // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
-          visit_id: visit.visitId,
-          referring_visit_id: visit.referringVisitId,
-          // URL-level history item fields (useful context, low cost)
-          history_item_id: item.id,
-          last_visit_time: item.lastVisitTime,
-          visit_count: item.visitCount,
-          typed_count: item.typedCount,
-          // Allow-list context (which list allowed this URL)
-          allowed_by_list: allowCheck.matchedList,
-          allowed_by_list_entry: allowCheck.matchEntry ? {
-            list_name: allowCheck.matchedList,
-            matched_pattern: allowCheck.matchEntry.pattern,
-            matched_pattern_type: allowCheck.matchEntry.pattern_type,
-            matched_source: allowCheck.matchEntry.source,
-            matched_metadata: allowCheck.matchEntry.metadata || {}
-          } : void 0,
-          // Filter-list context (safe: doesn't include original URL)
-          filtered: Boolean(filteredByList),
-          filtered_by_list: filteredByList,
-          filtered_by_list_entry: filterMatch ? {
-            list_name: filteredByList,
-            matched_pattern: filterMatch.pattern,
-            matched_pattern_type: filterMatch.pattern_type,
-            matched_source: filterMatch.source,
-            matched_metadata: filterMatch.metadata || {}
-          } : void 0,
-          // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
-          // Spread so these keys are simply absent when no match fired.
-          ...linkFields
-        });
-        collectedCount++;
+      } catch (error) {
+        console.error(`[rex-history] Skipping history item due to error processing it: ${item.url}`, error);
+        this.emitSkippedDiagnostic(item, failedStep, error);
       }
     }
     return { collectedCount, maxVisitTime };
+  }
+  /**
+   * Extract the registered domain from a URL using psl, returning 'not available'
+   * for anything unparseable. Never throws.
+   */
+  safeRegisteredDomain(url) {
+    try {
+      const parsed = na.parse(new URL(url).hostname);
+      if (parsed.error === void 0 && "domain" in parsed && parsed.domain) {
+        return parsed.domain;
+      }
+    } catch {
+    }
+    return "not available";
+  }
+  /**
+   * Privacy-safe shape descriptors for a URL: scheme, hostname length, and
+   * whether it carries a query string. These help recognise a pathological
+   * record (e.g. a giant URL, or one whose query string trips a redaction
+   * regex) without exposing any URL content. Never throws.
+   */
+  safeUrlShape(url) {
+    try {
+      const parsed = new URL(url);
+      return {
+        scheme: parsed.protocol,
+        hostname_length: parsed.hostname.length,
+        has_query: parsed.search.length > 0
+      };
+    } catch {
+      return { scheme: "not available", hostname_length: 0, has_query: false };
+    }
+  }
+  /**
+   * Emit a privacy-safe diagnostic when a history item is skipped because
+   * processing it threw. Researchers can see that (and why) a record was dropped
+   * without the raw URL or title ever leaving the device.
+   *
+   * Deliberately omits the raw URL and title. The lengths, URL shape, error
+   * details, and which step failed are enough to recognise a pathological record
+   * and act on it server-side. Emitted in the pdk-app-event family so it does
+   * not introduce a new data type.
+   */
+  emitSkippedDiagnostic(item, failedStep, error) {
+    try {
+      const shape = item.url ? this.safeUrlShape(item.url) : { scheme: "not available", hostname_length: 0, has_query: false };
+      let errorName = "unknown";
+      let errorMessage = String(error);
+      if (error instanceof Error) {
+        errorName = error.name;
+        errorMessage = error.message;
+      }
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-skipped",
+        event_details: {
+          domain: item.url ? this.safeRegisteredDomain(item.url) : "not available",
+          failed_step: failedStep,
+          error_name: errorName,
+          error_message: errorMessage,
+          url_length: item.url ? item.url.length : 0,
+          hostname_length: shape.hostname_length,
+          title_length: item.title ? item.title.length : 0,
+          scheme: shape.scheme,
+          has_query: shape.has_query,
+          visit_count: item.visitCount,
+          history_item_id: item.id,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-skipped diagnostic:", diagnosticError);
+    }
   }
   /**
    * Privacy baseline: skip URLs we should never collect/upload at all.
@@ -11415,6 +11579,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       "exact_url": 5,
       "regex": 4,
       "host_path_prefix": 3,
+      "subdomain_wildcard": 2,
       "host": 2,
       "domain": 1
     };
