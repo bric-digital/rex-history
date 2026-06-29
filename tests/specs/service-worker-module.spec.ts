@@ -1180,3 +1180,64 @@ test.describe('HistoryServiceWorkerModule — Cursor non-advance at same-timesta
     expect(visitUrls).toContain('https://newer.example.com')
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Cursor write failure diagnostic', () => {
+  /**
+   * When chrome.storage.local is full, setLastFetchTime's write silently fails
+   * (it only logged the error). A stalled cursor then looks identical to a
+   * healthy one from the backend's side: visits stop, no completion event, and
+   * nothing says WHY. This makes a quota-stalled participant invisible.
+   *
+   * Contract: a failed cursor write must (1) not throw — collection must not
+   * abort — and (2) emit a privacy-safe rex-history-cursor-write-failed
+   * diagnostic so the backend can see the stall and its cause.
+   */
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('a failed cursor write emits a diagnostic and does not throw', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      ;(window as any).__capturedEvents = []
+      // Arm the storage mock to reject writes to the cursor key (simulated quota).
+      ;(window as any).chrome.storage.local.__failSetFor = ['webmunkHistoryLastFetch']
+      let threw = false
+      try {
+        await (window as any).__historyPlugin.setLastFetchTime(Date.now())
+      } catch {
+        threw = true
+      }
+      ;(window as any).chrome.storage.local.__failSetFor = undefined
+      return { threw }
+    })
+
+    // (1) The write failure must not propagate — collection must survive it.
+    expect(result.threw).toBe(false)
+
+    // (2) A diagnostic must have been emitted so the backend can see the stall.
+    const diagnostics = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[])
+          .filter((e) => e.event_name === 'rex-history-cursor-write-failed')
+    )
+    expect(diagnostics.length).toBeGreaterThanOrEqual(1)
+    const d = diagnostics[0]!
+    expect(d.name).toBe('pdk-app-event')
+    const details = d.event_details as Record<string, unknown>
+    expect(typeof details.error_name).toBe('string')
+    expect(typeof details.error_message).toBe('string')
+    expect(typeof details.attempted_cursor).toBe('number')
+  })
+})

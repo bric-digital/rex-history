@@ -11105,6 +11105,29 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       });
     } catch (error) {
       console.error("[rex-history] Failed to set last fetch time:", error);
+      this.emitCursorWriteFailedDiagnostic(timestamp, error);
+    }
+  }
+  emitCursorWriteFailedDiagnostic(attemptedCursor, error) {
+    try {
+      let errorName = "unknown";
+      let errorMessage = String(error);
+      if (error instanceof Error) {
+        errorName = error.name;
+        errorMessage = error.message;
+      }
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-cursor-write-failed",
+        event_details: {
+          error_name: errorName,
+          error_message: errorMessage,
+          attempted_cursor: attemptedCursor,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-cursor-write-failed diagnostic:", diagnosticError);
     }
   }
   collectHistory() {
