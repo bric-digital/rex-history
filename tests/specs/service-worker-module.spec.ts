@@ -1105,23 +1105,308 @@ test.describe('HistoryServiceWorkerModule — Stranded isCollecting flag (Defect
   })
 })
 
+test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
+  /**
+   * The collection walk steps forward through fixed time windows
+   * [cursor, cursor+window) bounded by BOTH startTime and endTime, processing
+   * visits strictly inside each window before advancing the cursor to the
+   * window end. This replaces the old startTime-only, advance-by-max-visit-time
+   * walk, whose dependence on chrome.history.search's newest-first ordering
+   * meant older visits behind newer ones were never collected and heavy
+   * histories never finished within the MV3 worker lifetime.
+   */
+  async function setupWindowed(
+    page: import('@playwright/test').Page,
+    overrides: Record<string, unknown> = {}
+  ) {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page, overrides)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+    })
+    await page.waitForFunction(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  }
+
+  /** Settle on isCollecting=false without requiring a completion event. */
+  async function waitForSettled(page: import('@playwright/test').Page) {
+    await page.waitForFunction(
+      () => {
+        const s = (window as any).chrome.storage.local._data.webmunkHistoryStatus
+        return s && s.isCollecting === false && s.lastCollectionTime !== undefined
+      },
+      { timeout: 10_000 }
+    )
+  }
+
+  function visitUrls(page: import('@playwright/test').Page) {
+    return page.evaluate(() =>
+      ((window as any).__capturedEvents as Record<string, unknown>[])
+        .filter((e) => e.name === 'rex-history-visit')
+        .map((e) => e.url as string)
+    )
+  }
+
+  const HOUR = 60 * 60 * 1000
+  const DAY = 24 * HOUR
+
+  test('collects visits spread across many windows', async ({ page }) => {
+    // lookback 7d, 1h windows → ~168 windows. Seed one visit per day for 6 days;
+    // every one must be collected regardless of how many empty windows lie between.
+    await setupWindowed(page, { lookback_days: 7, collection_window_hours: 1 })
+    const now = Date.now()
+    const seeded: string[] = []
+    for (let d = 1; d <= 6; d++) {
+      const url = `https://day${d}.example.com/`
+      seeded.push(url)
+      await addHistoryItem(page, url, `Day ${d}`, now - d * DAY + HOUR)
+    }
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const urls = await visitUrls(page)
+    for (const url of seeded) {
+      expect(urls).toContain(url)
+    }
+  })
+
+  test('old visit behind a newer one is not skipped (backwards-walk regression)', async ({ page }) => {
+    // The exact failure: a newest-first page would advance the cursor past the
+    // old visit, which then never gets collected. Windowed walk must collect both.
+    await setupWindowed(page, { lookback_days: 7, collection_window_hours: 1 })
+    const now = Date.now()
+    await addHistoryItem(page, 'https://old.example.com/', 'Old', now - 5 * DAY)
+    await addHistoryItem(page, 'https://new.example.com/', 'New', now - 1 * HOUR)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://old.example.com/')
+    expect(urls).toContain('https://new.example.com/')
+  })
+
+  test('budget exhaustion emits progress (not complete) and persists a mid-walk cursor', async ({ page }) => {
+    // A tiny walk budget forces the cycle to stop before catching up to now.
+    // Expect: progress event, NO complete event, cursor advanced but < now.
+    await setupWindowed(page, {
+      lookback_days: 30,
+      collection_window_hours: 1,
+      collection_walk_budget_ms: 0 // stop after the first window every cycle
+    })
+    const now = Date.now()
+    // Visit early in the lookback window so the first 1h window has work but
+    // there's still far more range to cover before reaching now.
+    await addHistoryItem(page, 'https://early.example.com/', 'Early', now - 29 * DAY)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForSettled(page)
+
+    const events = await page.evaluate(() => (window as any).__capturedEvents as Record<string, unknown>[])
+    const hasComplete = events.some((e) => e.event_name === 'rex-history-collection-complete')
+    const hasProgress = events.some((e) => e.event_name === 'rex-history-collection-progress')
+    expect(hasProgress).toBe(true)
+    expect(hasComplete).toBe(false)
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    expect(cursor).toBeGreaterThan(now - 30 * DAY)
+    expect(cursor).toBeLessThan(now)
+  })
+
+  test('resumes from a persisted cursor after a cold worker start (adversarial MV3)', async ({ page }) => {
+    // Persist a mid-history cursor as a suspended-then-restarted worker would
+    // have left it. A fresh cycle must resume from there, not re-walk lookback.
+    await setupWindowed(page, { lookback_days: 30, collection_window_hours: 1 })
+    const now = Date.now()
+    const resumeFrom = now - 2 * HOUR
+    await page.evaluate(async (resumeFrom) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = resumeFrom
+      await window.chrome.storage.local.set(data)
+    }, resumeFrom)
+
+    // One visit BEFORE the resume cursor (must be skipped — already collected)
+    // and one AFTER (must be collected on resume).
+    await addHistoryItem(page, 'https://already.example.com/', 'Already', now - 10 * DAY)
+    await addHistoryItem(page, 'https://fresh.example.com/', 'Fresh', now - 1 * HOUR)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://fresh.example.com/')
+    expect(urls).not.toContain('https://already.example.com/')
+  })
+
+  test('fires collection-complete exactly once when caught up to now', async ({ page }) => {
+    await setupWindowed(page, { lookback_days: 7, collection_window_hours: 1 })
+    const now = Date.now()
+    await addHistoryItem(page, 'https://x.example.com/', 'X', now - 2 * HOUR)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const completes = await page.evaluate(() =>
+      ((window as any).__capturedEvents as Record<string, unknown>[])
+        .filter((e) => e.event_name === 'rex-history-collection-complete')
+    )
+    expect(completes.length).toBe(1)
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Cursor reaches ~now (within a window of it).
+    expect(cursor).toBeGreaterThanOrEqual(now - HOUR)
+  })
+
+  test('eager trigger backfills a large range to completion via re-armed alarms', async ({ page }) => {
+    // triggerHistoryCollection (offboarding path) must finish even when each
+    // wake's budget covers only part of the range, by re-arming an immediate
+    // alarm. We simulate the re-arm by re-firing the alarm whenever an eager
+    // cycle settles without completing, then assert completion is reached.
+    await setupWindowed(page, {
+      lookback_days: 10,
+      collection_window_hours: 24,
+      collection_walk_budget_ms: 0 // one window per wake → forces multiple wakes
+    })
+    const now = Date.now()
+    await addHistoryItem(page, 'https://b1.example.com/', 'B1', now - 9 * DAY)
+    await addHistoryItem(page, 'https://b2.example.com/', 'B2', now - 5 * DAY)
+    await addHistoryItem(page, 'https://b3.example.com/', 'B3', now - 1 * DAY)
+
+    const completed = await page.evaluate(async () => {
+      ;(window as any).__capturedEvents = []
+      const plugin = (window as any).__historyPlugin
+      // Eager backfill, then keep re-firing while it re-arms (mimics the
+      // immediate alarm the implementation schedules between eager wakes).
+      for (let i = 0; i < 30; i++) {
+        await plugin.collectHistory(true) // eager = true
+        const done = ((window as any).__capturedEvents as Record<string, unknown>[])
+          .some((e) => e.event_name === 'rex-history-collection-complete')
+        if (done) return true
+      }
+      return false
+    })
+    expect(completed).toBe(true)
+
+    const urls = await visitUrls(page)
+    expect(urls).toEqual(expect.arrayContaining([
+      'https://b1.example.com/', 'https://b2.example.com/', 'https://b3.example.com/'
+    ]))
+  })
+
+  test('first-run seed starts at install date, not lookback', async ({ page }) => {
+    // Install was 2 days ago; lookback is 30 days. A visit before install must
+    // NOT be collected; a visit after install must be. (max(install, now-lookback))
+    const now = Date.now()
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await page.evaluate((installTime) => {
+      ;(window as any).__mockInstallTime = installTime
+    }, now - 2 * DAY)
+    await seedConfigAndIdentifier(page, { lookback_days: 30, collection_window_hours: 24 })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+    })
+    await page.waitForFunction(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+
+    await addHistoryItem(page, 'https://preinstall.example.com/', 'Pre', now - 10 * DAY)
+    await addHistoryItem(page, 'https://postinstall.example.com/', 'Post', now - 1 * DAY)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://postinstall.example.com/')
+    expect(urls).not.toContain('https://preinstall.example.com/')
+  })
+
+  test('first-run seed falls back to lookback when install time is null', async ({ page }) => {
+    const now = Date.now()
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await page.evaluate(() => { (window as any).__mockInstallTime = null })
+    await seedConfigAndIdentifier(page, { lookback_days: 7, collection_window_hours: 24 })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+    })
+    await page.waitForFunction(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+
+    // Within the 7-day lookback → collected even though no install time exists.
+    await addHistoryItem(page, 'https://within.example.com/', 'Within', now - 3 * DAY)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://within.example.com/')
+  })
+
+  test('heavy window overflow emits a diagnostic and the cursor still advances', async ({ page }) => {
+    // More than collection_page_size visits inside a single minute: window
+    // splitting bottoms out at the 1-minute floor, so the walk collects the
+    // page best-effort, emits rex-history-window-overflow, advances past it,
+    // and still completes (never wedges).
+    await setupWindowed(page, {
+      lookback_days: 1,
+      collection_window_hours: 1,
+      collection_page_size: 2
+    })
+    const now = Date.now()
+    const minuteStart = now - 30 * 60 * 1000
+    // 4 visits inside the same minute (> page size 2).
+    for (let i = 0; i < 4; i++) {
+      await addHistoryItem(page, `https://hot${i}.example.com/`, `Hot ${i}`, minuteStart + i * 1000)
+    }
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const overflow = await page.evaluate(() =>
+      ((window as any).__capturedEvents as Record<string, unknown>[])
+        .filter((e) => e.event_name === 'rex-history-window-overflow')
+    )
+    expect(overflow.length).toBeGreaterThanOrEqual(1)
+    expect(overflow[0]!.name).toBe('pdk-app-event')
+
+    // The walk must reach now despite the hot minute.
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    expect(cursor).toBeGreaterThanOrEqual(now - HOUR)
+  })
+})
+
 test.describe('HistoryServiceWorkerModule — Cursor non-advance at same-timestamp boundary', () => {
   /**
-   * Reproduces the 1.3.10 field wedge: the durable cursor freezes at a
-   * timestamp shared by more than `collection_page_size` history items.
-   *
-   * After a successful cycle the durable cursor is persisted as the last
-   * collected visit time (exact, not +1). The next cycle fetches items with
-   * lastVisitTime >= cursor; processHistoryBatch skips every visit whose time
-   * is <= the cursor, so maxVisitTime never advances past the boundary. The
-   * walk exits with the cursor unmoved, and every subsequent alarm re-fetches
-   * the identical page — collecting nothing, never emitting completion, and
-   * starving any genuinely newer visit that sits behind the boundary cluster.
-   *
-   * The fix: when a non-empty page yields no cursor advance, step the cursor
-   * one ms past the stuck timestamp so the next fetch clears the cluster.
-   * Visits at exactly the old cursor were already collected on the prior cycle
-   * (that is what the cursor records), so stepping +1 loses no data.
+   * Reproduces the 1.3.10 field wedge: a timestamp cluster shared by more than
+   * `collection_page_size` history items. The old startTime-only walk froze
+   * here forever (page never advanced maxVisitTime). The windowed walk handles
+   * it structurally: a window returning a full page is split toward the
+   * 1-minute floor, and a cluster that still overflows the floor is collected
+   * best-effort while the cursor advances past it (window-overflow escape
+   * hatch). Either way the cursor moves and a newer visit behind the cluster is
+   * collected — which is what this test asserts (mechanism-independent).
    */
   test.beforeEach(async ({ page }) => {
     await page.goto('/test-page.html')

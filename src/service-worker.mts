@@ -22,14 +22,27 @@ interface HistoryConfig {
    */
   page_events_link_tolerance_ms?: number;
   /**
-   * Page size for the collection loop's chrome.history.search calls.
-   * This is a per-request page size, not a collection cap: the loop
-   * paginates by advancing a visit-time cursor until a page returns
-   * empty, so every record is collected regardless of this value.
-   * Smaller pages reduce per-request memory/latency in the service
-   * worker at the cost of more loop iterations. Default 1000 when unset.
+   * Per-request page size (chrome.history.search maxResults) within a single
+   * time window. Not a collection cap: the walk steps through fixed time
+   * windows, and a window that returns a full page is split toward a 1-minute
+   * floor so every record is still collected. Default 1000 when unset.
    */
   collection_page_size?: number;
+  /**
+   * Width of each forward collection window, in hours. The walk steps the
+   * cursor through [cursor, cursor+window) windows from the seed time toward
+   * now. Smaller windows mean more iterations but less work per window.
+   * Default 1 when unset.
+   */
+  collection_window_hours?: number;
+  /**
+   * Wall-clock budget (ms) for how long one alarm wake spends walking windows
+   * before yielding to the next alarm (MV3 worker-lifetime guard). The cursor
+   * is persisted after every closed window, so the next wake resumes cleanly.
+   * Default 20000 when unset. 0 means "one window per wake" (used in tests and
+   * as a hard floor — at least one window always runs).
+   */
+  collection_walk_budget_ms?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +58,12 @@ interface HistoryConfig {
 const URL_ACTIVE_BUFFER_MAX = 256
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
 const DEFAULT_COLLECTION_PAGE_SIZE = 1000
+const DEFAULT_COLLECTION_WINDOW_HOURS = 1
+const DEFAULT_WALK_BUDGET_MS = 20000
+// Recursion floor for splitting an over-full window. A window <= this width
+// that still overflows the page is collected best-effort (overflow escape
+// hatch) rather than split further — the walk must never wedge on one hot hour.
+const MIN_WINDOW_MS = 60000
 
 interface UrlActiveSeam {
   subscribe(listener: (event: RexPageUrlActiveEvent) => void): () => void
@@ -247,8 +266,15 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     // Set up alarm listener
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === 'rex-history-collection') {
+        // Periodic alarm → gentle (budget-limited) walk.
         console.log('[rex-history] Periodic collection triggered')
-        this.collectHistory().catch((error) => {
+        this.collectHistory(false).catch((error) => {
+          console.error('[rex-history] Collection error:', error)
+        })
+      } else if (alarm.name === 'rex-history-collection-eager') {
+        // Self-scheduled continuation of an eager backfill (see runCollectionCycle).
+        console.log('[rex-history] Eager backfill continuation triggered')
+        this.collectHistory(true).catch((error) => {
           console.error('[rex-history] Collection error:', error)
         })
       }
@@ -364,6 +390,21 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
+  /**
+   * Installation timestamp from rex-core, via its getInstallTime message API
+   * (rex-core owns this — do not read the rexInstallTime storage key directly).
+   * Returns null when rex-core hasn't recorded it yet or is too old to answer.
+   */
+  private async getInstallTime(): Promise<number | null> {
+    try {
+      const response = await chrome.runtime.sendMessage({ messageType: 'getInstallTime' })
+      return typeof response === 'number' ? response : null
+    } catch (error) {
+      console.error('[rex-history] Failed to get install time from rex-core:', error)
+      return null
+    }
+  }
+
   async getLastFetchTime(): Promise<number> {
     try {
       const result = await chrome.storage.local.get('webmunkHistoryLastFetch')
@@ -371,14 +412,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return result.webmunkHistoryLastFetch as number
       }
 
-      // If no last fetch time, use lookback_days from config
-      if (this.config) {
-        const lookbackMs = this.config.lookback_days * 24 * 60 * 60 * 1000
-        return Date.now() - lookbackMs
+      // First run: seed the cursor. Never collect from before the participant
+      // installed (rex-core install time), and never further back than
+      // lookback_days permits — whichever is more recent.
+      const now = Date.now()
+      const lookbackDays = this.config?.lookback_days ?? 30
+      const lookbackStart = now - lookbackDays * 24 * 60 * 60 * 1000
+      const installTime = await this.getInstallTime()
+      if (installTime !== null) {
+        return Math.max(installTime, lookbackStart)
       }
-
-      // Default to 30 days ago
-      return Date.now() - (30 * 24 * 60 * 60 * 1000)
+      return lookbackStart
     } catch (error) {
       console.error('[rex-history] Failed to get last fetch time:', error)
       return Date.now() - (30 * 24 * 60 * 60 * 1000)
@@ -426,7 +470,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
-  collectHistory(): Promise<void> {
+  collectHistory(eager = false): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
       return Promise.resolve()
@@ -464,7 +508,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         console.log('[rex-history] Starting history collection')
         return this.saveStatus()
       })
-      .then(() => this.runCollectionCycle())
+      .then(() => this.runCollectionCycle(eager))
       .catch((error: unknown) => {
         if (error instanceof Error && (error.message === 'NO_IDENTIFIER' || error.message === 'NO_CONFIGURATION')) {
           return
@@ -507,121 +551,185 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     return tryReload()
   }
 
-  private runCollectionCycle(): Promise<void> {
+  /**
+   * Walk browsing history forward in fixed time windows.
+   *
+   * The cursor (webmunkHistoryLastFetch) is a wall-clock time that marches
+   * monotonically from its seed (max(install_time, now - lookback_days)) toward
+   * cycleNow. Each window [cursor, windowEnd) is fully closed — all its visits
+   * processed — before the cursor advances to windowEnd. This replaces the old
+   * startTime-only walk that advanced by max-visit-time and therefore depended
+   * on chrome.history.search's newest-first ordering, which silently dropped
+   * older visits and never finished on heavy histories.
+   *
+   * Per-wake the walk is bounded by a wall-clock budget (MV3 worker-lifetime
+   * guard). When the budget is hit before catching up to now, it emits a
+   * progress event and yields: a periodic alarm resumes next cycle; an eager
+   * (offboarding) walk re-arms an immediate alarm to continue back-to-back.
+   * collection-complete fires only when the cursor actually reaches ~now.
+   */
+  private async runCollectionCycle(eager: boolean): Promise<void> {
+    const cycleNow = Date.now()
+    const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1000
+    const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS
+    const deadline = cycleNow + budgetMs
+
+    let cursor = await this.getLastFetchTime()
+    console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`)
+
     let collectedCount = 0
-    let lastProcessedVisitTime = 0
+    let windowsThisWake = 0
 
-    return this.getLastFetchTime()
-      .then((initialLastFetch) => {
-        lastProcessedVisitTime = initialLastFetch
-        console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`)
+    while (cursor < cycleNow) {
+      // Always run at least one window per wake (windowsThisWake === 0) so a
+      // zero/tiny budget still makes forward progress. After that, yield once
+      // the wall-clock budget is spent.
+      if (windowsThisWake > 0 && Date.now() >= deadline) {
+        break
+      }
 
-        const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
+      const windowEnd = Math.min(cursor + windowMs, cycleNow)
+      collectedCount += await this.collectWindow(cursor, windowEnd)
+      cursor = windowEnd
+      // Persist after every closed window so a worker killed mid-walk resumes
+      // exactly here on the next alarm rather than re-walking from the seed.
+      await this.setLastFetchTime(cursor)
+      windowsThisWake++
+    }
 
-        const fetchHistoryBatch = (durableCursor: number): Promise<void> => {
-          // Persist the PREVIOUS batch's cursor before fetching the next page.
-          // That batch's data points have had a full fetch+process cycle to
-          // clear PDK's ~1s persist debounce, so resuming past them cannot lose
-          // data. Lagging the durable cursor one batch behind the in-memory one
-          // means a service worker killed mid-walk resumes where it left off
-          // instead of re-walking from scratch on the next alarm (the cause of
-          // endless re-submission with no rex-history-collection-complete on
-          // heavy histories).
-          return this.setLastFetchTime(durableCursor)
-            .then(() => chrome.history.search({
-              text: '',
-              startTime: lastProcessedVisitTime,
-              maxResults: pageSize
-            }))
-            .then((historyItems) => {
-              console.log(`[rex-history] Found ${historyItems.length} history items`)
-              if (historyItems.length === 0) {
-                return
-              }
+    const caughtUp = cursor >= cycleNow
+    console.log(`[rex-history] Collected ${collectedCount} visits across ${windowsThisWake} window(s); caughtUp=${caughtUp}`)
 
-              return this.processHistoryBatch(historyItems, lastProcessedVisitTime)
-                .then((batchResult) => {
-                  collectedCount += batchResult.collectedCount
-                  if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
-                    // No visit in this page was newer than the cursor. If the
-                    // page was capped (>= pageSize items), more items may share
-                    // this exact timestamp than fit in one page — every fetch
-                    // returns the same un-advancing page and the walk wedges
-                    // here forever (never completing, starving newer visits
-                    // behind the cluster). Step the cursor 1ms past the stuck
-                    // timestamp to clear the cluster. Visits at exactly the old
-                    // cursor were already collected on the prior cycle, so this
-                    // loses no data. A non-full page genuinely means nothing
-                    // newer remains, so exit.
-                    if (historyItems.length >= pageSize) {
-                      lastProcessedVisitTime = lastProcessedVisitTime + 1
-                      return fetchHistoryBatch(lastProcessedVisitTime)
-                    }
-                    return
-                  }
-                  // Advance cursor so the next fetch only looks for newer visits.
-                  lastProcessedVisitTime = batchResult.maxVisitTime + 1
-                  return fetchHistoryBatch(lastProcessedVisitTime)
-                })
-            })
-        }
+    if (caughtUp && this.config?.generate_top_domains) {
+      await this.generateTopDomainsList()
+    }
 
-        return fetchHistoryBatch(lastProcessedVisitTime)
-      })
-      .then(() => {
-        console.log(`[rex-history] Collected ${collectedCount} history visits`)
-        if (this.config?.generate_top_domains) {
-          return this.generateTopDomainsList()
+    this.status.lastCollectionTime = Date.now()
+    this.status.itemsCollected += collectedCount
+    await this.setLastFetchTime(cursor)
+    await this.saveStatus()
+
+    if (caughtUp) {
+      await this.emitCollectionComplete(collectedCount)
+    } else {
+      // More range remains. Emit a heartbeat (not complete) and, in eager mode,
+      // re-arm an immediate alarm so the backfill continues without waiting for
+      // the next periodic tick.
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-progress',
+        event_details: {
+          collected_count: collectedCount,
+          cursor,
+          target: cycleNow,
+          date: Date.now()
         }
       })
-      .then(() => {
-        // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
-        // has elapsed since the last persist.  When multiple history events
-        // are dispatched in quick succession, only the first triggers a
-        // persist; later events stay in PDK's in-memory queue.  Dispatching
-        // a lightweight summary event after a short delay ensures the
-        // persist debounce has expired, so PDK flushes the entire queue.
-        // When no items were collected we still need to dispatch the
-        // completion event so callers (e.g. offboarding) know history
-        // collection finished.  Skip the 1.1s PDK-debounce delay since
-        // there is nothing queued to flush.
-        if (collectedCount === 0) {
-          dispatchEvent({
-            name: 'pdk-app-event',
-            event_name: 'rex-history-collection-complete',
-            event_details: {
-              collected_count: 0,
-              date: Date.now()
-            }
-          })
-          return Promise.resolve()
+      if (eager) {
+        this.rearmEagerAlarm()
+      }
+    }
+  }
+
+  /**
+   * Collect every visit inside [windowStart, windowEnd). If the window returns a
+   * full page it holds more URLs than one page can safely carry: split it toward
+   * MIN_WINDOW_MS. A sub-MIN_WINDOW_MS window that still overflows is collected
+   * best-effort and a privacy-safe overflow diagnostic is emitted — the walk
+   * never wedges on one abnormally heavy stretch. Returns visits collected.
+   */
+  private async collectWindow(windowStart: number, windowEnd: number): Promise<number> {
+    const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
+
+    const historyItems = await chrome.history.search({
+      text: '',
+      startTime: windowStart,
+      endTime: windowEnd,
+      maxResults: pageSize
+    })
+
+    if (historyItems.length >= pageSize) {
+      const span = windowEnd - windowStart
+      if (span > MIN_WINDOW_MS) {
+        // Split the window and process the halves in order.
+        const mid = windowStart + Math.floor(span / 2)
+        const first = await this.collectWindow(windowStart, mid)
+        const second = await this.collectWindow(mid, windowEnd)
+        return first + second
+      }
+      // Floor reached and still over-full (e.g. a cluster of same-timestamp
+      // visits). Re-fetch this minute uncapped so NO item is dropped, flag it,
+      // and process the whole set. A one-minute window is small enough that an
+      // uncapped fetch is safe, and this is the only way to avoid losing items
+      // beyond the first page.
+      this.emitWindowOverflowDiagnostic(windowStart, windowEnd, historyItems.length, pageSize)
+      const allItems = await chrome.history.search({
+        text: '',
+        startTime: windowStart,
+        endTime: windowEnd,
+        maxResults: 0 // 0 = no limit (chrome.history.search treats 0 as unlimited)
+      })
+      const overflowResult = await this.processHistoryBatch(allItems, windowStart, windowEnd)
+      return overflowResult.collectedCount
+    }
+
+    const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd)
+    return batchResult.collectedCount
+  }
+
+  /**
+   * Dispatch rex-history-collection-complete. Delays 1.1s when items were
+   * collected so PDK's ~1s persist debounce expires and the whole queue flushes;
+   * fires immediately when nothing was queued. Unchanged contract for the
+   * offboarding consumer that releases its "Collecting Data" spinner on this.
+   */
+  private async emitCollectionComplete(collectedCount: number): Promise<void> {
+    if (collectedCount > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1100))
+    }
+    dispatchEvent({
+      name: 'pdk-app-event',
+      event_name: 'rex-history-collection-complete',
+      event_details: {
+        collected_count: collectedCount,
+        date: Date.now()
+      }
+    })
+  }
+
+  private rearmEagerAlarm(): void {
+    // ponytail: Chrome clamps alarm delays to a 1-minute minimum in production,
+    // so an eager backfill resumes ~1 min later, not instantly. That is still
+    // far better than waiting for the periodic interval and avoids busy-looping
+    // the worker. If sub-minute resumption is ever needed, switch to a
+    // self-messaging continuation instead of an alarm.
+    chrome.alarms.create('rex-history-collection-eager', { delayInMinutes: 0.1 })
+  }
+
+  private emitWindowOverflowDiagnostic(windowStart: number, windowEnd: number, itemCount: number, pageSize: number): void {
+    try {
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-window-overflow',
+        event_details: {
+          window_start: windowStart,
+          window_end: windowEnd,
+          item_count: itemCount,
+          page_size: pageSize,
+          date: Date.now()
         }
-        return new Promise<void>((resolve) => setTimeout(resolve, 1100))
-          .then(() => {
-            dispatchEvent({
-              name: 'pdk-app-event',
-              event_name: 'rex-history-collection-complete',
-              event_details: {
-                collected_count: collectedCount,
-                date: Date.now()
-              }
-            })
-          })
       })
-      .then(() => {
-        this.status.lastCollectionTime = Date.now()
-        this.status.itemsCollected += collectedCount
-        return this.setLastFetchTime(lastProcessedVisitTime)
-      })
-      .then(() => this.saveStatus())
+    } catch (diagnosticError) {
+      console.error('[rex-history] Failed to emit rex-history-window-overflow diagnostic:', diagnosticError)
+    }
   }
 
   private async processHistoryBatch(
     historyItems: chrome.history.HistoryItem[],
-    lastFetch: number
-  ): Promise<{ collectedCount: number; maxVisitTime: number }> {
+    windowStart: number,
+    windowEnd: number
+  ): Promise<{ collectedCount: number }> {
     let collectedCount = 0
-    let maxVisitTime = lastFetch
 
     // Process each history item
     for (const item of historyItems) {
@@ -639,9 +747,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       const visits = await chrome.history.getVisits({ url: item.url })
 
       for (const visit of visits) {
-        // Only process visits after lastFetch
-        if (!visit.visitTime || visit.visitTime <= lastFetch) continue
-        maxVisitTime = Math.max(maxVisitTime, visit.visitTime)
+        // Process only visits inside this window [windowStart, windowEnd).
+        // A search() page can include items whose other visits fall outside the
+        // window (getVisits returns ALL of a URL's visits), so we filter here.
+        // The half-open interval matches the cursor advancing to windowEnd: a
+        // visit at exactly windowEnd belongs to the next window, not this one.
+        if (!visit.visitTime || visit.visitTime < windowStart || visit.visitTime >= windowEnd) continue
 
         // Basic privacy filter: only process http(s) URLs (and skip everything else like file://).
         if (this.shouldSkipUrl(item.url)) {
@@ -813,7 +924,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
     }
 
-    return { collectedCount, maxVisitTime }
+    return { collectedCount }
   }
 
   /**
@@ -1171,8 +1282,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     console.log('[rex-history] Received message:', message.messageType)
 
     if (message.messageType === 'triggerHistoryCollection') {
-      console.log('[rex-history] Triggering manual collection')
-      this.collectHistory().then(() => {
+      // Manual/offboarding trigger → eager backfill: walk to completion across
+      // back-to-back wakes so the offboarding spinner releases ASAP.
+      console.log('[rex-history] Triggering manual collection (eager)')
+      this.collectHistory(true).then(() => {
         sendResponse({ success: true })
       }).catch((error) => {
         sendResponse({ success: false, error: error.message })
