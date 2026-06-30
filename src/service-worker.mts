@@ -1,5 +1,5 @@
 import psl from 'psl'
-import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent, type EventPayload } from '@bric/rex-core/service-worker'
 import type { REXConfiguration } from '@bric/rex-core/common'
 import * as listUtils from '@bric/rex-lists'
 import { type RexPageUrlActiveEvent } from '@bric/rex-types/types'
@@ -62,6 +62,15 @@ interface HistoryStatus {
   listsReady?: boolean;
   configSource?: 'server' | 'none';
   effectiveConfig?: HistoryConfig;
+}
+
+interface ResolvedRecordedUrl {
+  recordedUrl: string;
+  recordedTitle: string;
+  registeredDomain: string;
+  filteredByList?: string | undefined;
+  filterMatch?: listUtils.ListEntry | undefined;
+  allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
 }
 
 /**
@@ -140,6 +149,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (this.urlActiveBuffer.length > URL_ACTIVE_BUFFER_MAX) {
       this.urlActiveBuffer.splice(0, this.urlActiveBuffer.length - URL_ACTIVE_BUFFER_MAX)
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), ms)
+    })
   }
 
   /**
@@ -370,15 +385,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       if (result.webmunkHistoryLastFetch) {
         return result.webmunkHistoryLastFetch as number
       }
-
-      // If no last fetch time, use lookback_days from config
-      if (this.config) {
-        const lookbackMs = this.config.lookback_days * 24 * 60 * 60 * 1000
-        return Date.now() - lookbackMs
-      }
-
-      // Default to 30 days ago
-      return Date.now() - (30 * 24 * 60 * 60 * 1000)
+      const lookbackDays = this.config?.lookback_days ?? 30
+      return Date.now() - lookbackDays * 24 * 60 * 60 * 1000
     } catch (error) {
       console.error('[rex-history] Failed to get last fetch time:', error)
       return Date.now() - (30 * 24 * 60 * 60 * 1000)
@@ -426,15 +434,15 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
-  collectHistory(): Promise<void> {
+  async collectHistory(): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
-      return Promise.resolve()
+      return
     }
 
     if (!this.status.listsReady) {
       console.log('[rex-history] Lists not yet synced, skipping collection')
-      return Promise.resolve()
+      return
     }
 
     // Set the flag synchronously BEFORE any async work so that concurrent
@@ -442,178 +450,273 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     // immediately and skip the destructive parseAndSyncLists cycle.
     this.status.isCollecting = true
 
-    // IMPORTANT: Do not collect or send data until user has entered an identifier
-    return this.hasIdentifier()
-      .then((hasIdentifier) => {
-        if (!hasIdentifier) {
-          console.warn('[rex-history] No identifier set - collection will not start until identifier is provided')
-          return Promise.reject(new Error('NO_IDENTIFIER'))
-        }
-        // Full loadConfiguration (with list sync) is safe here because
-        // isCollecting is already true, which prevents the storage.onChanged
-        // listener from starting a concurrent list sync.
-        return this.loadConfiguration()
-      })
-      .then(() => this.waitForConfiguration())
-      .then(() => {
-        if (!this.config) {
-          console.warn('[rex-history] No configuration available, skipping collection')
-          return Promise.reject(new Error('NO_CONFIGURATION'))
-        }
+    try {
+      // IMPORTANT: Do not collect or send data until user has entered an identifier
+      const hasIdentifier = await this.hasIdentifier()
+      if (!hasIdentifier) {
+        console.warn('[rex-history] No identifier set - collection will not start until identifier is provided')
+        throw new Error('NO_IDENTIFIER')
+      }
 
-        console.log('[rex-history] Starting history collection')
-        return this.saveStatus()
-      })
-      .then(() => this.runCollectionCycle())
-      .catch((error: unknown) => {
-        if (error instanceof Error && (error.message === 'NO_IDENTIFIER' || error.message === 'NO_CONFIGURATION')) {
-          return
-        }
+      // Full loadConfiguration (with list sync) is safe here because
+      // isCollecting is already true, which prevents the storage.onChanged
+      // listener from starting a concurrent list sync.
+      await this.loadConfiguration()
+      await this.waitForConfiguration()
 
-        console.error('[rex-history] Collection error:', error)
-        // Even on failure, record that we attempted a fetch so operators/tests can
-        // see activity and avoid "undefined" last-fetch state.
-        return this.setLastFetchTime(Date.now())
-      })
-      .finally(() => {
-        this.status.isCollecting = false
-        return this.saveStatus().finally(() => {
-          console.log('[rex-history] Collection complete')
-        })
-      })
+      if (!this.config) {
+        console.warn('[rex-history] No configuration available, skipping collection')
+        throw new Error('NO_CONFIGURATION')
+      }
+
+      console.log('[rex-history] Starting history collection')
+      await this.saveStatus()
+      await this.runCollectionCycle()
+    } catch (error: unknown) {
+      if (error instanceof Error && (error.message === 'NO_IDENTIFIER' || error.message === 'NO_CONFIGURATION')) {
+        return
+      }
+      console.error('[rex-history] Collection error:', error)
+      // Even on failure, record that we attempted a fetch so operators/tests can
+      // see activity and avoid "undefined" last-fetch state.
+      await this.setLastFetchTime(Date.now())
+    } finally {
+      this.status.isCollecting = false
+      await this.saveStatus()
+      console.log('[rex-history] Collection complete')
+    }
   }
 
-  private waitForConfiguration(): Promise<void> {
-    if (this.config) {
-      return Promise.resolve()
-    }
+  private async waitForConfiguration(): Promise<void> {
+    if (this.config) return
 
     const deadlineMs = Date.now() + 1500
-    const tryReload = (): Promise<void> => {
-      if (this.config) {
-        return Promise.resolve()
-      }
-      if (Date.now() >= deadlineMs) {
-        return Promise.resolve()
-      }
-
-      return new Promise<void>((resolve) => {
-        setTimeout(() => resolve(), 250)
-      })
-        .then(() => this.loadConfiguration())
-        .then(() => tryReload())
+    while (!this.config && Date.now() < deadlineMs) {
+      await this.sleep(250)
+      await this.loadConfiguration()
     }
-
-    return tryReload()
   }
 
-  private runCollectionCycle(): Promise<void> {
+  private async runCollectionCycle(): Promise<void> {
     let collectedCount = 0
-    let lastProcessedVisitTime = 0
+    let lastProcessedVisitTime = await this.getLastFetchTime()
+    console.log(`[rex-history] Fetching history since ${new Date(lastProcessedVisitTime).toISOString()}`)
 
-    return this.getLastFetchTime()
-      .then((initialLastFetch) => {
-        lastProcessedVisitTime = initialLastFetch
-        console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`)
+    const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
-        const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
+    let durableCursor = lastProcessedVisitTime
 
-        const fetchHistoryBatch = (durableCursor: number): Promise<void> => {
-          // Persist the PREVIOUS batch's cursor before fetching the next page.
-          // That batch's data points have had a full fetch+process cycle to
-          // clear PDK's ~1s persist debounce, so resuming past them cannot lose
-          // data. Lagging the durable cursor one batch behind the in-memory one
-          // means a service worker killed mid-walk resumes where it left off
-          // instead of re-walking from scratch on the next alarm (the cause of
-          // endless re-submission with no rex-history-collection-complete on
-          // heavy histories).
-          return this.setLastFetchTime(durableCursor)
-            .then(() => chrome.history.search({
-              text: '',
-              startTime: lastProcessedVisitTime,
-              maxResults: pageSize
-            }))
-            .then((historyItems) => {
-              console.log(`[rex-history] Found ${historyItems.length} history items`)
-              if (historyItems.length === 0) {
-                return
-              }
+    while (true) {
+      // Persist the PREVIOUS batch's cursor before fetching the next page. That
+      // batch's data points have had a full fetch+process cycle to clear PDK's
+      // ~1s persist debounce, so resuming past them cannot lose data. Lagging
+      // the durable cursor one batch behind the in-memory one means a service
+      // worker killed mid-walk resumes where it left off instead of re-walking
+      // from scratch on the next alarm (the cause of endless re-submission with
+      // no rex-history-collection-complete on heavy histories).
+      await this.setLastFetchTime(durableCursor)
+      const historyItems = await chrome.history.search({
+        text: '', startTime: lastProcessedVisitTime, maxResults: pageSize
+      })
+      console.log(`[rex-history] Found ${historyItems.length} history items`)
+      if (historyItems.length === 0) break
 
-              return this.processHistoryBatch(historyItems, lastProcessedVisitTime)
-                .then((batchResult) => {
-                  collectedCount += batchResult.collectedCount
-                  if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
-                    // No visit in this page was newer than the cursor. If the
-                    // page was capped (>= pageSize items), more items may share
-                    // this exact timestamp than fit in one page — every fetch
-                    // returns the same un-advancing page and the walk wedges
-                    // here forever (never completing, starving newer visits
-                    // behind the cluster). Step the cursor 1ms past the stuck
-                    // timestamp to clear the cluster. Visits at exactly the old
-                    // cursor were already collected on the prior cycle, so this
-                    // loses no data. A non-full page genuinely means nothing
-                    // newer remains, so exit.
-                    if (historyItems.length >= pageSize) {
-                      lastProcessedVisitTime = lastProcessedVisitTime + 1
-                      return fetchHistoryBatch(lastProcessedVisitTime)
-                    }
-                    return
-                  }
-                  // Advance cursor so the next fetch only looks for newer visits.
-                  lastProcessedVisitTime = batchResult.maxVisitTime + 1
-                  return fetchHistoryBatch(lastProcessedVisitTime)
-                })
-            })
+      const batchResult = await this.processHistoryBatch(historyItems, lastProcessedVisitTime)
+      collectedCount += batchResult.collectedCount
+      if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
+        // No visit in this page was newer than the cursor. If the page was
+        // capped (>= pageSize items), more items may share this exact timestamp
+        // than fit in one page — every fetch returns the same un-advancing page
+        // and the walk wedges here forever (never completing, starving newer
+        // visits behind the cluster). Step the cursor 1ms past the stuck
+        // timestamp to clear the cluster. Visits at exactly the old cursor were
+        // already collected on the prior cycle, so this loses no data. A
+        // non-full page genuinely means nothing newer remains, so exit.
+        if (historyItems.length < pageSize) break
+        lastProcessedVisitTime = lastProcessedVisitTime + 1
+        durableCursor = lastProcessedVisitTime
+        continue
+      }
+      // Advance cursor so the next fetch only looks for newer visits.
+      lastProcessedVisitTime = batchResult.maxVisitTime + 1
+      durableCursor = lastProcessedVisitTime
+    }
+
+    console.log(`[rex-history] Collected ${collectedCount} history visits`)
+    if (this.config?.generate_top_domains) {
+      await this.generateTopDomainsList()
+    }
+
+    // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
+    // has elapsed since the last persist.  When multiple history events
+    // are dispatched in quick succession, only the first triggers a
+    // persist; later events stay in PDK's in-memory queue.  Dispatching
+    // a lightweight summary event after a short delay ensures the
+    // persist debounce has expired, so PDK flushes the entire queue.
+    // When no items were collected we still need to dispatch the
+    // completion event so callers (e.g. offboarding) know history
+    // collection finished.  Skip the 1.1s PDK-debounce delay since
+    // there is nothing queued to flush.
+    if (collectedCount === 0) {
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-complete',
+        event_details: {
+          collected_count: 0,
+          date: Date.now()
         }
+      })
+    } else {
+      await this.sleep(1100)
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-complete',
+        event_details: {
+          collected_count: collectedCount,
+          date: Date.now()
+        }
+      })
+    }
 
-        return fetchHistoryBatch(lastProcessedVisitTime)
-      })
-      .then(() => {
-        console.log(`[rex-history] Collected ${collectedCount} history visits`)
-        if (this.config?.generate_top_domains) {
-          return this.generateTopDomainsList()
+    this.status.lastCollectionTime = Date.now()
+    this.status.itemsCollected += collectedCount
+    await this.setLastFetchTime(lastProcessedVisitTime)
+    await this.saveStatus()
+  }
+
+  private async resolveRecordedUrl(
+    url: string,
+    visit: chrome.history.VisitItem,
+    item: chrome.history.HistoryItem
+  ): Promise<ResolvedRecordedUrl> {
+    const ctx: { visit_id?: string; visit_time?: number; history_item_id?: string } = {
+      visit_id: visit.visitId,
+      history_item_id: item.id
+    }
+    // The caller only invokes resolveRecordedUrl for visits that passed its
+    // `!visit.visitTime` guard, so visitTime is defined here. Assign only when
+    // present so the optional property is omitted rather than set to undefined
+    // (exactOptionalPropertyTypes distinguishes the two).
+    if (visit.visitTime !== undefined) {
+      ctx.visit_time = visit.visitTime
+    }
+
+    let registeredDomain = this.safeRegisteredDomain(url)
+    // eslint-disable-next-line no-useless-assignment -- placates static analysis: every branch below reassigns recordedUrl before it is read, but the `= url` initializer documents the unfiltered default (applyFilterLists returns url unchanged on no match)
+    let recordedUrl = url
+    let recordedTitle = item.title || ''
+    let filteredByList: string | undefined
+    let filterMatch: listUtils.ListEntry | undefined
+
+    // Apply domain_only_lists FIRST: takes precedence over allow_lists.
+    // URLs on a domain_only_list are always collected at domain resolution,
+    // regardless of allow_list membership.
+    const domainOnlyResult = await this.applyDomainOnlyLists(url, ctx)
+
+    let allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry }
+
+    if (domainOnlyResult.filteredByList) {
+      recordedUrl = 'DOMAIN ONLY'
+      recordedTitle = 'DOMAIN ONLY'
+      filteredByList = domainOnlyResult.filteredByList
+      filterMatch = domainOnlyResult.filterMatch
+      allowCheck = { allowed: true }
+      // registeredDomain stays as-is (domain preserved — that's the point of domain_only)
+    } else {
+      // Apply allow_lists: if configured, only collect URLs matching an allow-list.
+      // If not allowed, create a dummy record (like blocklist behavior).
+      allowCheck = await this.checkAllowLists(url)
+
+      if (!allowCheck.allowed) {
+        // URL not on allowlist - create dummy record with category placeholder
+        recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
+        recordedTitle = ''
+        registeredDomain = ''
+        // Log debug event if enabled (dev-only)
+        await this.maybeLogFilteredUrlDebug(
+          url,
+          recordedUrl,
+          'NOT_ON_ALLOWLIST',
+          undefined,
+          ctx
+        )
+      } else {
+        // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
+        const filterResult = await this.applyFilterLists(url, ctx)
+        recordedUrl = filterResult.recordedUrl
+        filteredByList = filterResult.filteredByList
+        filterMatch = filterResult.filterMatch
+
+        // Privacy: if we masked the URL, mask the title and domain too.
+        if (recordedUrl.startsWith('CATEGORY:')) {
+          recordedTitle = ''
+          registeredDomain = ''
         }
-      })
-      .then(() => {
-        // PDK's enqueueDataPoint persists to IndexedDB only when >1 second
-        // has elapsed since the last persist.  When multiple history events
-        // are dispatched in quick succession, only the first triggers a
-        // persist; later events stay in PDK's in-memory queue.  Dispatching
-        // a lightweight summary event after a short delay ensures the
-        // persist debounce has expired, so PDK flushes the entire queue.
-        // When no items were collected we still need to dispatch the
-        // completion event so callers (e.g. offboarding) know history
-        // collection finished.  Skip the 1.1s PDK-debounce delay since
-        // there is nothing queued to flush.
-        if (collectedCount === 0) {
-          dispatchEvent({
-            name: 'pdk-app-event',
-            event_name: 'rex-history-collection-complete',
-            event_details: {
-              collected_count: 0,
-              date: Date.now()
-            }
-          })
-          return Promise.resolve()
-        }
-        return new Promise<void>((resolve) => setTimeout(resolve, 1100))
-          .then(() => {
-            dispatchEvent({
-              name: 'pdk-app-event',
-              event_name: 'rex-history-collection-complete',
-              event_details: {
-                collected_count: collectedCount,
-                date: Date.now()
-              }
-            })
-          })
-      })
-      .then(() => {
-        this.status.lastCollectionTime = Date.now()
-        this.status.itemsCollected += collectedCount
-        return this.setLastFetchTime(lastProcessedVisitTime)
-      })
-      .then(() => this.saveStatus())
+      }
+    }
+
+    return { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck }
+  }
+
+  private buildVisitEvent(
+    item: chrome.history.HistoryItem,
+    visit: chrome.history.VisitItem,
+    resolved: ResolvedRecordedUrl,
+    categories: string[],
+    linkFields: Record<string, unknown>
+  ): EventPayload {
+    return {
+      name: 'rex-history-visit',
+      // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
+      url: resolved.recordedUrl,
+      recorded_url: resolved.recordedUrl,
+      domain: resolved.registeredDomain,
+      title: resolved.recordedTitle,
+      visit_time: visit.visitTime,
+      transition_type: visit.transition,
+      is_local: visit.isLocal,
+      categories: categories,
+      date: visit.visitTime,
+
+      // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
+      visit_id: visit.visitId,
+      referring_visit_id: visit.referringVisitId,
+
+      // URL-level history item fields (useful context, low cost)
+      history_item_id: item.id,
+      last_visit_time: item.lastVisitTime,
+      visit_count: item.visitCount,
+      typed_count: item.typedCount,
+
+      // Allow-list context (which list allowed this URL)
+      allowed_by_list: resolved.allowCheck.matchedList,
+      allowed_by_list_entry: resolved.allowCheck.matchEntry
+        ? {
+            list_name: resolved.allowCheck.matchedList,
+            matched_pattern: resolved.allowCheck.matchEntry.pattern,
+            matched_pattern_type: resolved.allowCheck.matchEntry.pattern_type,
+            matched_source: resolved.allowCheck.matchEntry.source,
+            matched_metadata: resolved.allowCheck.matchEntry.metadata || {}
+          }
+        : undefined,
+
+      // Filter-list context (safe: doesn't include original URL)
+      filtered: Boolean(resolved.filteredByList),
+      filtered_by_list: resolved.filteredByList,
+      filtered_by_list_entry: resolved.filterMatch
+        ? {
+            list_name: resolved.filteredByList,
+            matched_pattern: resolved.filterMatch.pattern,
+            matched_pattern_type: resolved.filterMatch.pattern_type,
+            matched_source: resolved.filterMatch.source,
+            matched_metadata: resolved.filterMatch.metadata || {}
+          }
+        : undefined,
+
+      // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
+      // Spread so these keys are simply absent when no match fired.
+      ...linkFields,
+    }
   }
 
   private async processHistoryBatch(
@@ -648,83 +751,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           continue
         }
 
-        // Extract registered domain from URL using psl
-        let registeredDomain = 'not available'
-        try {
-          const urlObj = new URL(item.url)
-          const hostname = urlObj.hostname
-          const parsed = psl.parse(hostname)
-          if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-            registeredDomain = parsed.domain
-          }
-        } catch {
-          // Keep default 'not available' for invalid URLs
-        }
-
-        let recordedUrl = item.url
-        let recordedTitle = item.title || ''
-        let filteredByList: string | undefined
-        let filterMatch: listUtils.ListEntry | undefined
-
-        // Apply domain_only_lists FIRST: takes precedence over allow_lists.
-        // URLs on a domain_only_list are always collected at domain resolution,
-        // regardless of allow_list membership.
         failedStep = 'list-matching'
-        const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
-          visit_id: visit.visitId,
-          visit_time: visit.visitTime,
-          history_item_id: item.id
-        })
-
-        let allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry }
-
-        if (domainOnlyResult.filteredByList) {
-          recordedUrl = 'DOMAIN ONLY'
-          recordedTitle = 'DOMAIN ONLY'
-          filteredByList = domainOnlyResult.filteredByList
-          filterMatch = domainOnlyResult.filterMatch
-          allowCheck = { allowed: true }
-          // registeredDomain stays as-is (domain preserved — that's the point of domain_only)
-        } else {
-          // Apply allow_lists: if configured, only collect URLs matching an allow-list.
-          // If not allowed, create a dummy record (like blocklist behavior).
-          allowCheck = await this.checkAllowLists(item.url)
-
-          if (!allowCheck.allowed) {
-            // URL not on allowlist - create dummy record with category placeholder
-            recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
-            recordedTitle = ''
-            registeredDomain = ''
-            // Log debug event if enabled (dev-only)
-            await this.maybeLogFilteredUrlDebug(
-              item.url,
-              recordedUrl,
-              'NOT_ON_ALLOWLIST',
-              undefined,
-              {
-                visit_id: visit.visitId,
-                visit_time: visit.visitTime,
-                history_item_id: item.id
-              }
-            )
-          } else {
-            // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
-            const filterResult = await this.applyFilterLists(item.url, {
-              visit_id: visit.visitId,
-              visit_time: visit.visitTime,
-              history_item_id: item.id
-            })
-            recordedUrl = filterResult.recordedUrl
-            filteredByList = filterResult.filteredByList
-            filterMatch = filterResult.filterMatch
-
-            // Privacy: if we masked the URL, mask the title and domain too.
-            if (recordedUrl.startsWith('CATEGORY:')) {
-              recordedTitle = ''
-              registeredDomain = ''
-            }
-          }
-        }
+        const resolved = await this.resolveRecordedUrl(item.url, visit, item)
 
         // Categorize against category lists
         failedStep = 'categorize'
@@ -736,8 +764,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // against accidentally un-redacting via linkage metadata. When the URL is
         // not redacted, we pass the raw URL to match against buffer records.
         // When rex-page-events isn't installed, the buffer is empty and this is a no-op.
-        const matchUrl = recordedUrl.startsWith('CATEGORY:') || recordedUrl === ''
-          ? recordedUrl
+        const matchUrl = resolved.recordedUrl.startsWith('CATEGORY:') || resolved.recordedUrl === ''
+          ? resolved.recordedUrl
           : item.url
         const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime)
         const linkFields = linkMatch !== null
@@ -752,58 +780,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // Dispatch event to all modules (PDK will pick it up for upload)
         failedStep = 'dispatch'
         console.log('[rex-history] Logging event: rex-history-visit')
-        dispatchEvent({
-          name: 'rex-history-visit',
-          // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
-          url: recordedUrl,
-          recorded_url: recordedUrl,
-          domain: registeredDomain,
-          title: recordedTitle,
-          visit_time: visit.visitTime,
-          transition_type: visit.transition,
-          is_local: visit.isLocal,
-          categories: categories,
-          date: visit.visitTime,
-
-          // Stable per-visit identifiers (useful for dedup + sequence reconstruction)
-          visit_id: visit.visitId,
-          referring_visit_id: visit.referringVisitId,
-
-          // URL-level history item fields (useful context, low cost)
-          history_item_id: item.id,
-          last_visit_time: item.lastVisitTime,
-          visit_count: item.visitCount,
-          typed_count: item.typedCount,
-
-          // Allow-list context (which list allowed this URL)
-          allowed_by_list: allowCheck.matchedList,
-          allowed_by_list_entry: allowCheck.matchEntry
-            ? {
-                list_name: allowCheck.matchedList,
-                matched_pattern: allowCheck.matchEntry.pattern,
-                matched_pattern_type: allowCheck.matchEntry.pattern_type,
-                matched_source: allowCheck.matchEntry.source,
-                matched_metadata: allowCheck.matchEntry.metadata || {}
-              }
-            : undefined,
-
-          // Filter-list context (safe: doesn't include original URL)
-          filtered: Boolean(filteredByList),
-          filtered_by_list: filteredByList,
-          filtered_by_list_entry: filterMatch
-            ? {
-                list_name: filteredByList,
-                matched_pattern: filterMatch.pattern,
-                matched_pattern_type: filterMatch.pattern_type,
-                matched_source: filterMatch.source,
-                matched_metadata: filterMatch.metadata || {}
-              }
-            : undefined,
-
-          // Optional linkage to rex-page-events (tab/session identity + exact url_shown_at).
-          // Spread so these keys are simply absent when no match fired.
-          ...linkFields,
-        })
+        dispatchEvent(this.buildVisitEvent(item, visit, resolved, categories, linkFields))
 
         collectedCount++
       }
