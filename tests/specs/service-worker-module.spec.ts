@@ -1306,16 +1306,18 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     ]))
   })
 
-  test('first-run seed starts at install date, not lookback', async ({ page }) => {
-    // Install was 2 days ago; lookback is 30 days. A visit before install must
-    // NOT be collected; a visit after install must be. (max(install, now-lookback))
+  test('first-run seed is lookback_days BEFORE install time', async ({ page }) => {
+    // Install was 2 days ago; lookback is 5 days → seed = 7 days before now.
+    // A visit 10 days ago (before the seed) must NOT be collected; a visit
+    // 4 days ago (after the seed, i.e. within the lookback window leading up to
+    // install) MUST be collected even though it predates install.
     const now = Date.now()
     await page.goto('/test-page.html')
     await waitForModuleSetup(page)
     await page.evaluate((installTime) => {
       ;(window as any).__mockInstallTime = installTime
     }, now - 2 * DAY)
-    await seedConfigAndIdentifier(page, { lookback_days: 30, collection_window_hours: 24 })
+    await seedConfigAndIdentifier(page, { lookback_days: 5, collection_window_hours: 24 })
     await page.evaluate(async () => {
       await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
     })
@@ -1324,16 +1326,17 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
       { timeout: 5_000 }
     )
 
-    await addHistoryItem(page, 'https://preinstall.example.com/', 'Pre', now - 10 * DAY)
-    await addHistoryItem(page, 'https://postinstall.example.com/', 'Post', now - 1 * DAY)
+    // Seed = install(−2d) − lookback(5d) = −7d from now.
+    await addHistoryItem(page, 'https://beforeseed.example.com/', 'BeforeSeed', now - 10 * DAY)
+    await addHistoryItem(page, 'https://withinwindow.example.com/', 'WithinWindow', now - 4 * DAY)
 
     await page.evaluate(() => { (window as any).__capturedEvents = [] })
     await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
     await waitForCollectionComplete(page)
 
     const urls = await visitUrls(page)
-    expect(urls).toContain('https://postinstall.example.com/')
-    expect(urls).not.toContain('https://preinstall.example.com/')
+    expect(urls).toContain('https://withinwindow.example.com/')
+    expect(urls).not.toContain('https://beforeseed.example.com/')
   })
 
   test('first-run seed falls back to lookback when install time is null', async ({ page }) => {

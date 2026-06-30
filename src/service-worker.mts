@@ -58,6 +58,7 @@ interface HistoryConfig {
 const URL_ACTIVE_BUFFER_MAX = 256
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
 const DEFAULT_COLLECTION_PAGE_SIZE = 1000
+const DEFAULT_LOOKBACK_DAYS = 90
 const DEFAULT_COLLECTION_WINDOW_HOURS = 1
 const DEFAULT_WALK_BUDGET_MS = 20000
 // Recursion floor for splitting an over-full window. A window <= this width
@@ -412,20 +413,19 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return result.webmunkHistoryLastFetch as number
       }
 
-      // First run: seed the cursor. Never collect from before the participant
-      // installed (rex-core install time), and never further back than
-      // lookback_days permits — whichever is more recent.
+      // First run: seed the cursor at lookback_days BEFORE the install time, so
+      // the backfill covers the lookback window leading up to enrollment (and
+      // everything since). When rex-core can't supply an install time (older
+      // rex-core, or not yet recorded), fall back to lookback_days before now.
       const now = Date.now()
-      const lookbackDays = this.config?.lookback_days ?? 30
-      const lookbackStart = now - lookbackDays * 24 * 60 * 60 * 1000
+      const lookbackDays = this.config?.lookback_days ?? DEFAULT_LOOKBACK_DAYS
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000
       const installTime = await this.getInstallTime()
-      if (installTime !== null) {
-        return Math.max(installTime, lookbackStart)
-      }
-      return lookbackStart
+      const anchor = installTime ?? now
+      return anchor - lookbackMs
     } catch (error) {
       console.error('[rex-history] Failed to get last fetch time:', error)
-      return Date.now() - (30 * 24 * 60 * 60 * 1000)
+      return Date.now() - (DEFAULT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
     }
   }
 
@@ -555,7 +555,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * Walk browsing history forward in fixed time windows.
    *
    * The cursor (webmunkHistoryLastFetch) is a wall-clock time that marches
-   * monotonically from its seed (max(install_time, now - lookback_days)) toward
+   * monotonically from its seed (lookback_days before install time) toward
    * cycleNow. Each window [cursor, windowEnd) is fully closed — all its visits
    * processed — before the cursor advances to windowEnd. This replaces the old
    * startTime-only walk that advanced by max-visit-time and therefore depended
@@ -1301,7 +1301,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
     if (message.messageType === 'getOldestHistoryAge') {
       console.log('[rex-history] Searching for oldest history item')
-      const lookbackDays = this.config?.lookback_days ?? 30
+      const lookbackDays = this.config?.lookback_days ?? DEFAULT_LOOKBACK_DAYS
       const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000
 
       chrome.history.search({ text: '', startTime: 0, maxResults: 10000 })

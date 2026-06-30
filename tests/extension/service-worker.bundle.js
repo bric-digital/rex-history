@@ -10888,6 +10888,7 @@ function matchesPattern(url, pattern, patternType) {
 var URL_ACTIVE_BUFFER_MAX = 256;
 var DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5e3;
 var DEFAULT_COLLECTION_PAGE_SIZE = 1e3;
+var DEFAULT_LOOKBACK_DAYS = 90;
 var DEFAULT_COLLECTION_WINDOW_HOURS = 1;
 var DEFAULT_WALK_BUDGET_MS = 2e4;
 var MIN_WINDOW_MS = 6e4;
@@ -11145,16 +11146,14 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         return result.webmunkHistoryLastFetch;
       }
       const now = Date.now();
-      const lookbackDays = this.config?.lookback_days ?? 30;
-      const lookbackStart = now - lookbackDays * 24 * 60 * 60 * 1e3;
+      const lookbackDays = this.config?.lookback_days ?? DEFAULT_LOOKBACK_DAYS;
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1e3;
       const installTime = await this.getInstallTime();
-      if (installTime !== null) {
-        return Math.max(installTime, lookbackStart);
-      }
-      return lookbackStart;
+      const anchor = installTime ?? now;
+      return anchor - lookbackMs;
     } catch (error) {
       console.error("[rex-history] Failed to get last fetch time:", error);
-      return Date.now() - 30 * 24 * 60 * 60 * 1e3;
+      return Date.now() - DEFAULT_LOOKBACK_DAYS * 24 * 60 * 60 * 1e3;
     }
   }
   async setLastFetchTime(timestamp) {
@@ -11247,7 +11246,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
    * Walk browsing history forward in fixed time windows.
    *
    * The cursor (webmunkHistoryLastFetch) is a wall-clock time that marches
-   * monotonically from its seed (max(install_time, now - lookback_days)) toward
+   * monotonically from its seed (lookback_days before install time) toward
    * cycleNow. Each window [cursor, windowEnd) is fully closed — all its visits
    * processed — before the cursor advances to windowEnd. This replaces the old
    * startTime-only walk that advanced by max-visit-time and therefore depended
@@ -11800,7 +11799,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     }
     if (message.messageType === "getOldestHistoryAge") {
       console.log("[rex-history] Searching for oldest history item");
-      const lookbackDays = this.config?.lookback_days ?? 30;
+      const lookbackDays = this.config?.lookback_days ?? DEFAULT_LOOKBACK_DAYS;
       const lookbackMs = lookbackDays * 24 * 60 * 60 * 1e3;
       globalThis.chrome.history.search({ text: "", startTime: 0, maxResults: 1e4 }).then((items) => {
         if (items.length === 0) {
