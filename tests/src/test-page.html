@@ -74,6 +74,12 @@
                         return { ...window.chrome.storage.local._data };
                     },
                     set: async (items) => {
+                        // Test hook: force a rejection for specific keys to simulate
+                        // a full chrome.storage.local quota (e.g. cursor-write failure).
+                        const failKeys = window.chrome.storage.local.__failSetFor;
+                        if (failKeys && Object.keys(items).some(k => failKeys.includes(k))) {
+                            throw new Error('QUOTA_BYTES quota exceeded');
+                        }
                         Object.assign(window.chrome.storage.local._data, items);
                         // Trigger onChanged listeners
                         if (window.chrome.storage.onChanged._listeners.length > 0) {
