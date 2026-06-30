@@ -2,6 +2,24 @@ var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
+// node_modules/@bric/rex-core/src/common.mts
+function hash(cleartext, algorithm) {
+  if (algorithm === void 0) {
+    algorithm = "SHA-256";
+  }
+  return new Promise((resolve) => {
+    const msgUint8 = new TextEncoder().encode(cleartext);
+    crypto.subtle.digest(algorithm, msgUint8).then((hashBuffer) => {
+      const hexBytes = new Uint8Array(hashBuffer);
+      const hashHex = Array.from(
+        hexBytes,
+        (byte) => byte.toString(16).padStart(2, "0")
+      ).join("");
+      resolve(hashHex);
+    });
+  });
+}
+
 // node_modules/@bric/rex-core/src/service-worker.mts
 var REXServiceWorkerModule = class _REXServiceWorkerModule {
   constructor() {
@@ -69,7 +87,6 @@ var rexCorePlugin = {
         }
       }
     });
-    console.log("chrome.windows.create");
     globalThis.chrome.windows.create({
       height: 480,
       width: 640,
@@ -81,6 +98,11 @@ var rexCorePlugin = {
     console.log(`[rex-core] Running setup...`);
     globalThis.chrome.runtime.onInstalled.addListener(function(details) {
       console.log(`[rex-core] chrome.runtime.onInstalled.addListener`);
+      globalThis.chrome.storage.local.get("rexInstallTime").then((response) => {
+        if (response.rexInstallTime === void 0) {
+          globalThis.chrome.storage.local.set({ rexInstallTime: Date.now() });
+        }
+      });
       rexCorePlugin.openExtensionWindow();
     });
     globalThis.chrome.action.onClicked.addListener(function(tab) {
@@ -197,16 +219,25 @@ var rexCorePlugin = {
       });
       return true;
     }
+    if (message.messageType == "getInstallTime") {
+      globalThis.chrome.storage.local.get("rexInstallTime").then((response) => {
+        sendResponse(response.rexInstallTime ?? null);
+      });
+      return true;
+    }
     if (message.messageType == "openWindow") {
       rexCorePlugin.openExtensionWindow();
       return true;
     }
     if (message.messageType == "logEvent") {
+      let loggedCount = 0;
       for (const extensionModule of registeredExtensionModules) {
         if (extensionModule.logEvent !== void 0) {
           extensionModule.logEvent(message.event);
+          loggedCount += 1;
         }
       }
+      sendResponse(loggedCount);
       return true;
     }
     if (message.messageType == "fetchValue") {
@@ -325,13 +356,16 @@ var rexCorePlugin = {
       });
     });
   },
-  fetchConfiguration() {
+  fetchConfiguration: () => {
     return new Promise((resolve, reject) => {
       globalThis.chrome.storage.local.get("REXConfiguration").then((response) => {
         const idResponse = response;
         resolve(idResponse.REXConfiguration);
       });
     });
+  },
+  generateHash: (cleartext, algorithm = "SHA-256") => {
+    return hash(cleartext, algorithm);
   }
 };
 var service_worker_default = rexCorePlugin;
@@ -10369,8 +10403,8 @@ async function getLastSyncedListsHash() {
     return void 0;
   }
 }
-async function setLastSyncedListsHash(hash) {
-  await globalThis.chrome.storage.local.set({ [LISTS_HASH_STORAGE_KEY]: hash });
+async function setLastSyncedListsHash(hash2) {
+  await globalThis.chrome.storage.local.set({ [LISTS_HASH_STORAGE_KEY]: hash2 });
 }
 var debugEnabled = false;
 function normalizeLeadingWww(host) {
@@ -10854,6 +10888,9 @@ function matchesPattern(url, pattern, patternType) {
 var URL_ACTIVE_BUFFER_MAX = 256;
 var DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5e3;
 var DEFAULT_COLLECTION_PAGE_SIZE = 1e3;
+var DEFAULT_COLLECTION_WINDOW_HOURS = 1;
+var DEFAULT_WALK_BUDGET_MS = 2e4;
+var MIN_WINDOW_MS = 6e4;
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
 }
@@ -10989,7 +11026,12 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     globalThis.chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === "rex-history-collection") {
         console.log("[rex-history] Periodic collection triggered");
-        this.collectHistory().catch((error) => {
+        this.collectHistory(false).catch((error) => {
+          console.error("[rex-history] Collection error:", error);
+        });
+      } else if (alarm.name === "rex-history-collection-eager") {
+        console.log("[rex-history] Eager backfill continuation triggered");
+        this.collectHistory(true).catch((error) => {
           console.error("[rex-history] Collection error:", error);
         });
       }
@@ -11082,17 +11124,34 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to save status:", error);
     }
   }
+  /**
+   * Installation timestamp from rex-core, via its getInstallTime message API
+   * (rex-core owns this — do not read the rexInstallTime storage key directly).
+   * Returns null when rex-core hasn't recorded it yet or is too old to answer.
+   */
+  async getInstallTime() {
+    try {
+      const response = await globalThis.chrome.runtime.sendMessage({ messageType: "getInstallTime" });
+      return typeof response === "number" ? response : null;
+    } catch (error) {
+      console.error("[rex-history] Failed to get install time from rex-core:", error);
+      return null;
+    }
+  }
   async getLastFetchTime() {
     try {
       const result = await globalThis.chrome.storage.local.get("webmunkHistoryLastFetch");
       if (result.webmunkHistoryLastFetch) {
         return result.webmunkHistoryLastFetch;
       }
-      if (this.config) {
-        const lookbackMs = this.config.lookback_days * 24 * 60 * 60 * 1e3;
-        return Date.now() - lookbackMs;
+      const now = Date.now();
+      const lookbackDays = this.config?.lookback_days ?? 30;
+      const lookbackStart = now - lookbackDays * 24 * 60 * 60 * 1e3;
+      const installTime = await this.getInstallTime();
+      if (installTime !== null) {
+        return Math.max(installTime, lookbackStart);
       }
-      return Date.now() - 30 * 24 * 60 * 60 * 1e3;
+      return lookbackStart;
     } catch (error) {
       console.error("[rex-history] Failed to get last fetch time:", error);
       return Date.now() - 30 * 24 * 60 * 60 * 1e3;
@@ -11130,7 +11189,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to emit rex-history-cursor-write-failed diagnostic:", diagnosticError);
     }
   }
-  collectHistory() {
+  collectHistory(eager = false) {
     if (this.status.isCollecting) {
       console.log("[rex-history] Collection already in progress, skipping");
       return Promise.resolve();
@@ -11153,7 +11212,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       }
       console.log("[rex-history] Starting history collection");
       return this.saveStatus();
-    }).then(() => this.runCollectionCycle()).catch((error) => {
+    }).then(() => this.runCollectionCycle(eager)).catch((error) => {
       if (error instanceof Error && (error.message === "NO_IDENTIFIER" || error.message === "NO_CONFIGURATION")) {
         return;
       }
@@ -11184,82 +11243,154 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     };
     return tryReload();
   }
-  runCollectionCycle() {
+  /**
+   * Walk browsing history forward in fixed time windows.
+   *
+   * The cursor (webmunkHistoryLastFetch) is a wall-clock time that marches
+   * monotonically from its seed (max(install_time, now - lookback_days)) toward
+   * cycleNow. Each window [cursor, windowEnd) is fully closed — all its visits
+   * processed — before the cursor advances to windowEnd. This replaces the old
+   * startTime-only walk that advanced by max-visit-time and therefore depended
+   * on chrome.history.search's newest-first ordering, which silently dropped
+   * older visits and never finished on heavy histories.
+   *
+   * Per-wake the walk is bounded by a wall-clock budget (MV3 worker-lifetime
+   * guard). When the budget is hit before catching up to now, it emits a
+   * progress event and yields: a periodic alarm resumes next cycle; an eager
+   * (offboarding) walk re-arms an immediate alarm to continue back-to-back.
+   * collection-complete fires only when the cursor actually reaches ~now.
+   */
+  async runCollectionCycle(eager) {
+    const cycleNow = Date.now();
+    const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1e3;
+    const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS;
+    const deadline = cycleNow + budgetMs;
+    let cursor = await this.getLastFetchTime();
+    console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`);
     let collectedCount = 0;
-    let lastProcessedVisitTime = 0;
-    return this.getLastFetchTime().then((initialLastFetch) => {
-      lastProcessedVisitTime = initialLastFetch;
-      console.log(`[rex-history] Fetching history since ${new Date(initialLastFetch).toISOString()}`);
-      const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE;
-      const fetchHistoryBatch = (durableCursor) => {
-        return this.setLastFetchTime(durableCursor).then(() => globalThis.chrome.history.search({
-          text: "",
-          startTime: lastProcessedVisitTime,
-          maxResults: pageSize
-        })).then((historyItems) => {
-          console.log(`[rex-history] Found ${historyItems.length} history items`);
-          if (historyItems.length === 0) {
-            return;
-          }
-          return this.processHistoryBatch(historyItems, lastProcessedVisitTime).then((batchResult) => {
-            collectedCount += batchResult.collectedCount;
-            if (batchResult.maxVisitTime <= lastProcessedVisitTime) {
-              if (historyItems.length >= pageSize) {
-                lastProcessedVisitTime = lastProcessedVisitTime + 1;
-                return fetchHistoryBatch(lastProcessedVisitTime);
-              }
-              return;
-            }
-            lastProcessedVisitTime = batchResult.maxVisitTime + 1;
-            return fetchHistoryBatch(lastProcessedVisitTime);
-          });
-        });
-      };
-      return fetchHistoryBatch(lastProcessedVisitTime);
-    }).then(() => {
-      console.log(`[rex-history] Collected ${collectedCount} history visits`);
-      if (this.config?.generate_top_domains) {
-        return this.generateTopDomainsList();
+    let windowsThisWake = 0;
+    while (cursor < cycleNow) {
+      if (windowsThisWake > 0 && Date.now() >= deadline) {
+        break;
       }
-    }).then(() => {
-      if (collectedCount === 0) {
-        dispatchEvent({
-          name: "pdk-app-event",
-          event_name: "rex-history-collection-complete",
-          event_details: {
-            collected_count: 0,
-            date: Date.now()
-          }
-        });
-        return Promise.resolve();
-      }
-      return new Promise((resolve) => setTimeout(resolve, 1100)).then(() => {
-        dispatchEvent({
-          name: "pdk-app-event",
-          event_name: "rex-history-collection-complete",
-          event_details: {
-            collected_count: collectedCount,
-            date: Date.now()
-          }
-        });
+      const windowEnd = Math.min(cursor + windowMs, cycleNow);
+      collectedCount += await this.collectWindow(cursor, windowEnd);
+      cursor = windowEnd;
+      await this.setLastFetchTime(cursor);
+      windowsThisWake++;
+    }
+    const caughtUp = cursor >= cycleNow;
+    console.log(`[rex-history] Collected ${collectedCount} visits across ${windowsThisWake} window(s); caughtUp=${caughtUp}`);
+    if (caughtUp && this.config?.generate_top_domains) {
+      await this.generateTopDomainsList();
+    }
+    this.status.lastCollectionTime = Date.now();
+    this.status.itemsCollected += collectedCount;
+    await this.setLastFetchTime(cursor);
+    await this.saveStatus();
+    if (caughtUp) {
+      await this.emitCollectionComplete(collectedCount);
+    } else {
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-collection-progress",
+        event_details: {
+          collected_count: collectedCount,
+          cursor,
+          target: cycleNow,
+          date: Date.now()
+        }
       });
-    }).then(() => {
-      this.status.lastCollectionTime = Date.now();
-      this.status.itemsCollected += collectedCount;
-      return this.setLastFetchTime(lastProcessedVisitTime);
-    }).then(() => this.saveStatus());
+      if (eager) {
+        this.rearmEagerAlarm();
+      }
+    }
   }
-  async processHistoryBatch(historyItems, lastFetch) {
+  /**
+   * Collect every visit inside [windowStart, windowEnd). If the window returns a
+   * full page it holds more URLs than one page can safely carry: split it toward
+   * MIN_WINDOW_MS. A sub-MIN_WINDOW_MS window that still overflows is collected
+   * best-effort and a privacy-safe overflow diagnostic is emitted — the walk
+   * never wedges on one abnormally heavy stretch. Returns visits collected.
+   */
+  async collectWindow(windowStart, windowEnd) {
+    const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE;
+    const historyItems = await globalThis.chrome.history.search({
+      text: "",
+      startTime: windowStart,
+      endTime: windowEnd,
+      maxResults: pageSize
+    });
+    if (historyItems.length >= pageSize) {
+      const span = windowEnd - windowStart;
+      if (span > MIN_WINDOW_MS) {
+        const mid = windowStart + Math.floor(span / 2);
+        const first = await this.collectWindow(windowStart, mid);
+        const second = await this.collectWindow(mid, windowEnd);
+        return first + second;
+      }
+      this.emitWindowOverflowDiagnostic(windowStart, windowEnd, historyItems.length, pageSize);
+      const allItems = await globalThis.chrome.history.search({
+        text: "",
+        startTime: windowStart,
+        endTime: windowEnd,
+        maxResults: 0
+        // 0 = no limit (chrome.history.search treats 0 as unlimited)
+      });
+      const overflowResult = await this.processHistoryBatch(allItems, windowStart, windowEnd);
+      return overflowResult.collectedCount;
+    }
+    const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd);
+    return batchResult.collectedCount;
+  }
+  /**
+   * Dispatch rex-history-collection-complete. Delays 1.1s when items were
+   * collected so PDK's ~1s persist debounce expires and the whole queue flushes;
+   * fires immediately when nothing was queued. Unchanged contract for the
+   * offboarding consumer that releases its "Collecting Data" spinner on this.
+   */
+  async emitCollectionComplete(collectedCount) {
+    if (collectedCount > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+    }
+    dispatchEvent({
+      name: "pdk-app-event",
+      event_name: "rex-history-collection-complete",
+      event_details: {
+        collected_count: collectedCount,
+        date: Date.now()
+      }
+    });
+  }
+  rearmEagerAlarm() {
+    globalThis.chrome.alarms.create("rex-history-collection-eager", { delayInMinutes: 0.1 });
+  }
+  emitWindowOverflowDiagnostic(windowStart, windowEnd, itemCount, pageSize) {
+    try {
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-window-overflow",
+        event_details: {
+          window_start: windowStart,
+          window_end: windowEnd,
+          item_count: itemCount,
+          page_size: pageSize,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-window-overflow diagnostic:", diagnosticError);
+    }
+  }
+  async processHistoryBatch(historyItems, windowStart, windowEnd) {
     let collectedCount = 0;
-    let maxVisitTime = lastFetch;
     for (const item of historyItems) {
       if (!item.url) continue;
       let failedStep = "getVisits";
       try {
         const visits = await globalThis.chrome.history.getVisits({ url: item.url });
         for (const visit of visits) {
-          if (!visit.visitTime || visit.visitTime <= lastFetch) continue;
-          maxVisitTime = Math.max(maxVisitTime, visit.visitTime);
+          if (!visit.visitTime || visit.visitTime < windowStart || visit.visitTime >= windowEnd) continue;
           if (this.shouldSkipUrl(item.url)) {
             continue;
           }
@@ -11384,7 +11515,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         this.emitSkippedDiagnostic(item, failedStep, error);
       }
     }
-    return { collectedCount, maxVisitTime };
+    return { collectedCount };
   }
   /**
    * Extract the registered domain from a URL using psl, returning 'not available'
@@ -11654,8 +11785,8 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
   handleMessage(message, sender, sendResponse) {
     console.log("[rex-history] Received message:", message.messageType);
     if (message.messageType === "triggerHistoryCollection") {
-      console.log("[rex-history] Triggering manual collection");
-      this.collectHistory().then(() => {
+      console.log("[rex-history] Triggering manual collection (eager)");
+      this.collectHistory(true).then(() => {
         sendResponse({ success: true });
       }).catch((error) => {
         sendResponse({ success: false, error: error.message });
