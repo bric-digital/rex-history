@@ -45,6 +45,13 @@
             runtime: {
                 getManifest: () => ({ name: 'Webmunk Dev Extension' }),
                 sendMessage: async (message) => {
+                    // rex-core getInstallTime message: tests set
+                    // window.__mockInstallTime to control the value (null = not
+                    // recorded / older rex-core). Default null so first-run seed
+                    // falls back to lookback_days unless a test opts in.
+                    if (message && message.messageType === 'getInstallTime') {
+                        return window.__mockInstallTime ?? null;
+                    }
                     // Mock message handling
                     return { success: true };
                 },
@@ -114,12 +121,28 @@
             },
             history: {
                 _items: [],
-                search: async ({ text, startTime, maxResults }) => {
+                search: async ({ text, startTime, endTime, maxResults }) => {
+                    // Mirror chrome.history.search range semantics: return items
+                    // that have at least one visit within [startTime, endTime).
+                    // Honour endTime (the real API does; the old mock ignored it,
+                    // so it could not reproduce the windowed-walk behavior).
                     return window.chrome.history._items.filter(item => {
-                        if (startTime && item.lastVisitTime < startTime) return false;
                         if (text && !item.url.includes(text) && !item.title?.includes(text)) return false;
-                        return true;
-                    }).slice(0, maxResults || 100);
+                        const visits = item._visits || [];
+                        const inRange = visits.some(v =>
+                            (startTime === undefined || v.visitTime >= startTime) &&
+                            (endTime === undefined || v.visitTime < endTime)
+                        );
+                        // Fall back to lastVisitTime for items seeded without _visits.
+                        if (visits.length === 0) {
+                            if (startTime !== undefined && item.lastVisitTime < startTime) return false;
+                            if (endTime !== undefined && item.lastVisitTime >= endTime) return false;
+                            return true;
+                        }
+                        return inRange;
+                    // maxResults === 0 means unlimited (matches chrome.history.search);
+                    // undefined falls back to the API's 100 default.
+                    }).slice(0, maxResults === 0 ? undefined : (maxResults || 100));
                 },
                 getVisits: async ({ url }) => {
                     const item = window.chrome.history._items.find(i => i.url === url);
