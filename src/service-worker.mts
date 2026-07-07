@@ -65,6 +65,16 @@ const DEFAULT_WALK_BUDGET_MS = 20000
 // that still overflows the page is collected best-effort (overflow escape
 // hatch) rather than split further — the walk must never wedge on one hot hour.
 const MIN_WINDOW_MS = 60000
+// Durable marker written immediately BEFORE the uncapped overflow fetch+process,
+// cleared immediately after it succeeds. If a pathological minute (e.g. tens of
+// thousands of same-timestamp dumped visits) makes that uncapped batch exceed
+// the MV3 ~5-min worker kill, the worker dies mid-batch and this marker survives.
+// On the next worker start loadStatus() finds it, knows the previous attempt at
+// that window crashed (because a clean run would have cleared it), emits a
+// server-visible rex-history-overflow-stuck event (which now transmits — a fresh
+// worker has no crash pending), and skips the poison window so the walk escapes
+// instead of re-crashing on it forever.
+const OVERFLOW_MARKER_KEY = 'webmunkHistoryOverflowMarker'
 
 interface UrlActiveSeam {
   subscribe(listener: (event: RexPageUrlActiveEvent) => void): () => void
@@ -379,6 +389,52 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     // mid-cycle and stranded a `true` in storage (it would otherwise wedge every
     // future collection via the guard in collectHistory).
     this.status.isCollecting = false
+
+    await this.recoverFromOverflowCrash()
+  }
+
+  /**
+   * Self-heal a worker that was killed mid-overflow. A stranded OVERFLOW_MARKER_KEY
+   * means the previous worker started an uncapped fetch+process for a pathological
+   * minute and never finished (a clean run clears the marker). Left alone, the next
+   * cycle re-reads the same cursor, hits the same poison window, and re-crashes —
+   * a new flavor of the infinite resend loop. So here, on a fresh worker with no
+   * crash pending, we emit a server-visible diagnostic (which now actually
+   * transmits) and advance the cursor past the poison window so the walk escapes.
+   * Skipping that one minute loses only the pathological cluster; the alternative
+   * is never completing at all.
+   */
+  private async recoverFromOverflowCrash(): Promise<void> {
+    try {
+      const stored = await chrome.storage.local.get(OVERFLOW_MARKER_KEY)
+      const marker = stored[OVERFLOW_MARKER_KEY] as
+        | { windowStart: number; windowEnd: number; itemCount: number; attemptedAt: number }
+        | undefined
+      if (!marker) {
+        return
+      }
+      console.error('[rex-history] Overflow crash detected — previous worker died processing the window', new Date(marker.windowStart).toISOString(), '..', new Date(marker.windowEnd).toISOString(), `(${marker.itemCount} items). Skipping it.`)
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-overflow-stuck',
+        event_details: {
+          window_start: marker.windowStart,
+          window_end: marker.windowEnd,
+          item_count: marker.itemCount,
+          attempted_at: marker.attemptedAt,
+          date: Date.now()
+        }
+      })
+      // Advance the cursor past the poison window so the resumed walk skips it,
+      // but only forward — never rewind a cursor that has already moved on.
+      const current = await this.getLastFetchTime()
+      if (current < marker.windowEnd) {
+        await this.setLastFetchTime(marker.windowEnd)
+      }
+      await chrome.storage.local.remove(OVERFLOW_MARKER_KEY)
+    } catch (error) {
+      console.error('[rex-history] Failed to recover from overflow crash:', error)
+    }
   }
 
   async saveStatus() {
@@ -663,6 +719,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       // uncapped fetch is safe, and this is the only way to avoid losing items
       // beyond the first page.
       this.emitWindowOverflowDiagnostic(windowStart, windowEnd, historyItems.length, pageSize)
+      // Persist a durable marker BEFORE the uncapped fetch+process. If that work
+      // exceeds the MV3 worker lifetime and the worker is killed mid-batch, this
+      // marker is the only evidence that survives — loadStatus() reads it on the
+      // next start to report and skip the poison window (see OVERFLOW_MARKER_KEY).
+      await chrome.storage.local.set({
+        [OVERFLOW_MARKER_KEY]: { windowStart, windowEnd, itemCount: historyItems.length, attemptedAt: Date.now() }
+      })
       const allItems = await chrome.history.search({
         text: '',
         startTime: windowStart,
@@ -670,6 +733,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         maxResults: 0 // 0 = no limit (chrome.history.search treats 0 as unlimited)
       })
       const overflowResult = await this.processHistoryBatch(allItems, windowStart, windowEnd)
+      // Survived the uncapped batch — clear the marker so a later worker start
+      // does not mistake this window for a crash.
+      await chrome.storage.local.remove(OVERFLOW_MARKER_KEY)
       return overflowResult.collectedCount
     }
 

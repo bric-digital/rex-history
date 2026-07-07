@@ -10892,6 +10892,7 @@ var DEFAULT_LOOKBACK_DAYS = 90;
 var DEFAULT_COLLECTION_WINDOW_HOURS = 1;
 var DEFAULT_WALK_BUDGET_MS = 2e4;
 var MIN_WINDOW_MS = 6e4;
+var OVERFLOW_MARKER_KEY = "webmunkHistoryOverflowMarker";
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
 }
@@ -11115,6 +11116,46 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to load status:", error);
     }
     this.status.isCollecting = false;
+    await this.recoverFromOverflowCrash();
+  }
+  /**
+   * Self-heal a worker that was killed mid-overflow. A stranded OVERFLOW_MARKER_KEY
+   * means the previous worker started an uncapped fetch+process for a pathological
+   * minute and never finished (a clean run clears the marker). Left alone, the next
+   * cycle re-reads the same cursor, hits the same poison window, and re-crashes —
+   * a new flavor of the infinite resend loop. So here, on a fresh worker with no
+   * crash pending, we emit a server-visible diagnostic (which now actually
+   * transmits) and advance the cursor past the poison window so the walk escapes.
+   * Skipping that one minute loses only the pathological cluster; the alternative
+   * is never completing at all.
+   */
+  async recoverFromOverflowCrash() {
+    try {
+      const stored = await globalThis.chrome.storage.local.get(OVERFLOW_MARKER_KEY);
+      const marker = stored[OVERFLOW_MARKER_KEY];
+      if (!marker) {
+        return;
+      }
+      console.error("[rex-history] Overflow crash detected \u2014 previous worker died processing the window", new Date(marker.windowStart).toISOString(), "..", new Date(marker.windowEnd).toISOString(), `(${marker.itemCount} items). Skipping it.`);
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-overflow-stuck",
+        event_details: {
+          window_start: marker.windowStart,
+          window_end: marker.windowEnd,
+          item_count: marker.itemCount,
+          attempted_at: marker.attemptedAt,
+          date: Date.now()
+        }
+      });
+      const current = await this.getLastFetchTime();
+      if (current < marker.windowEnd) {
+        await this.setLastFetchTime(marker.windowEnd);
+      }
+      await globalThis.chrome.storage.local.remove(OVERFLOW_MARKER_KEY);
+    } catch (error) {
+      console.error("[rex-history] Failed to recover from overflow crash:", error);
+    }
   }
   async saveStatus() {
     try {
@@ -11329,6 +11370,9 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         return first + second;
       }
       this.emitWindowOverflowDiagnostic(windowStart, windowEnd, historyItems.length, pageSize);
+      await globalThis.chrome.storage.local.set({
+        [OVERFLOW_MARKER_KEY]: { windowStart, windowEnd, itemCount: historyItems.length, attemptedAt: Date.now() }
+      });
       const allItems = await globalThis.chrome.history.search({
         text: "",
         startTime: windowStart,
@@ -11337,6 +11381,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         // 0 = no limit (chrome.history.search treats 0 as unlimited)
       });
       const overflowResult = await this.processHistoryBatch(allItems, windowStart, windowEnd);
+      await globalThis.chrome.storage.local.remove(OVERFLOW_MARKER_KEY);
       return overflowResult.collectedCount;
     }
     const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd);
