@@ -1398,6 +1398,73 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     )
     expect(cursor).toBeGreaterThanOrEqual(now - HOUR)
   })
+
+  test('recovers from a worker killed mid-overflow (adversarial MV3 overflow crash)', async ({ page }) => {
+    // Simulate the doomsday minute: the previous worker wrote the durable overflow
+    // marker, started the uncapped fetch+process, and was KILLED before clearing
+    // it (the uncapped batch on a pathological same-timestamp dump exceeds the MV3
+    // ~5-min worker lifetime). The cursor is still parked at the poison window's
+    // start, so a naive resume would re-hit and re-crash it forever. A cold worker
+    // start must instead skip the window, emit a server-visible stuck diagnostic,
+    // and clear the marker.
+    await setupWindowed(page, { lookback_days: 1, collection_window_hours: 1 })
+    const now = Date.now()
+    const windowStart = now - 30 * 60 * 1000
+    const windowEnd = windowStart + 60 * 1000 // 1-minute floor window
+
+    const result = await page.evaluate(async ({ windowStart, windowEnd }) => {
+      const data = (window as any).chrome.storage.local._data
+      // Stranded marker + cursor parked at the poison window, as the killed
+      // worker would have left them.
+      data.webmunkHistoryOverflowMarker = { windowStart, windowEnd, itemCount: 50000, attemptedAt: Date.now() }
+      data.webmunkHistoryLastFetch = windowStart
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+
+      // Cold worker start.
+      await (window as any).__historyPlugin.loadStatus()
+
+      return {
+        cursor: data.webmunkHistoryLastFetch as number,
+        markerStillPresent: 'webmunkHistoryOverflowMarker' in data,
+        stuck: ((window as any).__capturedEvents as Record<string, unknown>[])
+          .filter((e) => e.event_name === 'rex-history-overflow-stuck')
+      }
+    }, { windowStart, windowEnd })
+
+    // Cursor jumped PAST the poison window so the resumed walk won't re-hit it.
+    expect(result.cursor).toBe(windowEnd)
+    // The marker self-cleared.
+    expect(result.markerStillPresent).toBe(false)
+    // A server-visible diagnostic fired (this is the signal that survives the crash).
+    expect(result.stuck.length).toBe(1)
+    expect(result.stuck[0]!.name).toBe('pdk-app-event')
+  })
+
+  test('a clean run with no overflow marker does not move the cursor on worker start', async ({ page }) => {
+    // Guard against false positives: loadStatus() must NOT skip anything when no
+    // overflow marker is present.
+    await setupWindowed(page, { lookback_days: 1, collection_window_hours: 1 })
+    const now = Date.now()
+    const parked = now - 2 * HOUR
+
+    const result = await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      delete data.webmunkHistoryOverflowMarker
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+      await (window as any).__historyPlugin.loadStatus()
+      return {
+        cursor: data.webmunkHistoryLastFetch as number,
+        stuck: ((window as any).__capturedEvents as Record<string, unknown>[])
+          .filter((e) => e.event_name === 'rex-history-overflow-stuck').length
+      }
+    }, parked)
+
+    expect(result.cursor).toBe(parked)
+    expect(result.stuck).toBe(0)
+  })
 })
 
 test.describe('HistoryServiceWorkerModule — Cursor non-advance at same-timestamp boundary', () => {
