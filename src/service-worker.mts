@@ -1373,6 +1373,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       chrome.history.search({ text: '', startTime: 0, maxResults: 10000 })
         .then((items) => {
           if (items.length === 0) {
+            console.log('[rex-history] getOldestHistoryAge: no history items found, ageSeconds=null')
             sendResponse({ ageSeconds: null })
             return
           }
@@ -1392,14 +1393,25 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
                   (min, item) => Math.min(min, item.lastVisitTime ?? oldestVisitTime),
                   oldestVisitTime
                 )
-                sendResponse({ ageSeconds: (Date.now() - oldest) / 1000 })
+                const ageSeconds = (Date.now() - oldest) / 1000
+                console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldest).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`)
+                sendResponse({ ageSeconds })
               })
-              .catch(() => sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1000 }))
+              .catch((error) => {
+                const ageSeconds = (Date.now() - oldestVisitTime) / 1000
+                console.warn('[rex-history] getOldestHistoryAge: second-page search failed, falling back to first-page oldest:', error)
+                sendResponse({ ageSeconds })
+              })
           } else {
-            sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1000 })
+            const ageSeconds = (Date.now() - oldestVisitTime) / 1000
+            console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldestVisitTime).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`)
+            sendResponse({ ageSeconds })
           }
         })
-        .catch(() => sendResponse({ ageSeconds: null }))
+        .catch((error) => {
+          console.warn('[rex-history] getOldestHistoryAge: history search failed, ageSeconds=null:', error)
+          sendResponse({ ageSeconds: null })
+        })
       return true
     }
 
