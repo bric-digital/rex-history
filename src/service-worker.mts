@@ -11,6 +11,13 @@ interface HistoryConfig {
   allow_lists: string[];
   category_lists: string[];
   domain_only_lists: string[];
+  /**
+   * What to record for URLs that match no allow_list (when allow_lists are
+   * configured). Default ('category') records a CATEGORY:NOT_ON_ALLOWLIST dummy
+   * with domain blanked. 'domain_only' preserves the registered domain (same
+   * shape as domain_only_lists records) — filter_lists still fully redact.
+   */
+  not_on_allowlist_behavior?: 'category' | 'domain_only';
   generate_top_domains: boolean;
   top_domains_count: number;
   top_domains_list_name: string;
@@ -868,22 +875,44 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           allowCheck = await this.checkAllowLists(item.url)
 
           if (!allowCheck.allowed) {
-            // URL not on allowlist - create dummy record with category placeholder
-            recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
-            recordedTitle = ''
-            registeredDomain = ''
-            // Log debug event if enabled (dev-only)
-            await this.maybeLogFilteredUrlDebug(
-              item.url,
-              recordedUrl,
-              'NOT_ON_ALLOWLIST',
-              undefined,
-              {
+            if (this.config?.not_on_allowlist_behavior === 'domain_only') {
+              // Blocked sites must stay fully redacted even when the fallback
+              // preserves domains, so consult filter_lists before demoting.
+              const filterResult = await this.applyFilterLists(item.url, {
                 visit_id: visit.visitId,
                 visit_time: visit.visitTime,
                 history_item_id: item.id
+              })
+
+              if (filterResult.filteredByList) {
+                recordedUrl = filterResult.recordedUrl
+                recordedTitle = ''
+                registeredDomain = ''
+                filteredByList = filterResult.filteredByList
+                filterMatch = filterResult.filterMatch
+              } else {
+                recordedUrl = 'DOMAIN ONLY'
+                recordedTitle = 'DOMAIN ONLY'
+                // registeredDomain preserved — same shape as domain_only_lists records
               }
-            )
+            } else {
+              // URL not on allowlist - create dummy record with category placeholder
+              recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
+              recordedTitle = ''
+              registeredDomain = ''
+              // Log debug event if enabled (dev-only)
+              await this.maybeLogFilteredUrlDebug(
+                item.url,
+                recordedUrl,
+                'NOT_ON_ALLOWLIST',
+                undefined,
+                {
+                  visit_id: visit.visitId,
+                  visit_time: visit.visitTime,
+                  history_item_id: item.id
+                }
+              )
+            }
           } else {
             // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
             const filterResult = await this.applyFilterLists(item.url, {
@@ -1356,6 +1385,38 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }).catch((error) => {
         sendResponse({ success: false, error: error.message })
       })
+      return true
+    }
+
+    if (message.messageType === 'resetHistoryCollection') {
+      // Rewind the walk cursor to its first-run seed and re-collect. Callers
+      // should expect already-collected visits to be re-emitted; pairing this
+      // with clearing downstream storage is the caller's decision.
+      //
+      // An in-flight collection must finish first: collectHistory() silently
+      // no-ops while isCollecting is true, and the in-flight walk would write
+      // the cursor right back — turning the reset into a data-clearing no-op.
+      console.log('[rex-history] Resetting collection cursor and re-collecting (eager)')
+
+      const waitForIdle = (): Promise<void> => {
+        if (this.status.isCollecting === false) {
+          return Promise.resolve()
+        }
+
+        return new Promise((resolve) => {
+          setTimeout(() => { waitForIdle().then(resolve) }, 250)
+        })
+      }
+
+      waitForIdle()
+        .then(() => chrome.storage.local.remove('webmunkHistoryLastFetch'))
+        .then(() => this.collectHistory(true))
+        .then(() => {
+          sendResponse({ success: true })
+        })
+        .catch((error) => {
+          sendResponse({ success: false, error: error.message })
+        })
       return true
     }
 

@@ -655,6 +655,79 @@ test.describe('HistoryServiceWorkerModule — Allow Lists', () => {
     expect(event.title).toBe('')
   })
 
+  test('not_on_allowlist_behavior domain_only records unmatched URLs at domain resolution', async ({ page }) => {
+    const now = Date.now()
+    await setupAllowConfig(page, { not_on_allowlist_behavior: 'domain_only' })
+
+    await page.evaluate(async () => {
+      await (window as any).__listUtils.bulkCreateListEntries([{
+        list_name: 'study-sites',
+        pattern: 'bbc.com',
+        pattern_type: 'domain',
+        source: 'server',
+        metadata: {}
+      }])
+    })
+
+    await addHistoryItem(page, 'https://www.example.com/private/page', 'Example', now - 500)
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit'
+        )
+    )
+    expect(events.length).toBeGreaterThanOrEqual(1)
+    const event = events[0]!
+    expect(event.url).toBe('DOMAIN ONLY')
+    expect(event.title).toBe('DOMAIN ONLY')
+    expect(event.domain).toBe('example.com')
+  })
+
+  test('filter lists still fully redact unmatched URLs under domain_only behavior', async ({ page }) => {
+    const now = Date.now()
+    await setupAllowConfig(page, {
+      not_on_allowlist_behavior: 'domain_only',
+      filter_lists: ['blocked-sites']
+    })
+
+    await page.evaluate(async () => {
+      await (window as any).__listUtils.bulkCreateListEntries([{
+        list_name: 'study-sites',
+        pattern: 'bbc.com',
+        pattern_type: 'domain',
+        source: 'server',
+        metadata: {}
+      }, {
+        list_name: 'blocked-sites',
+        pattern: 'private-social.com',
+        pattern_type: 'domain',
+        source: 'server',
+        metadata: { category: 'social' }
+      }])
+    })
+
+    await addHistoryItem(page, 'https://private-social.com/profile/me', 'My Profile', now - 500)
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit'
+        )
+    )
+    expect(events.length).toBeGreaterThanOrEqual(1)
+    const event = events[0]!
+    expect(event.url).toBe('CATEGORY:social')
+    expect(event.domain).toBe('')
+    expect(event.title).toBe('')
+  })
+
   test('no allow list configured collects all URLs', async ({ page }) => {
     const now = Date.now()
     // No allow_lists = allow everything
@@ -1594,5 +1667,88 @@ test.describe('HistoryServiceWorkerModule — Cursor write failure diagnostic', 
     expect(typeof details.error_name).toBe('string')
     expect(typeof details.error_message).toBe('string')
     expect(typeof details.attempted_cursor).toBe('number')
+  })
+})
+
+test.describe('HistoryServiceWorkerModule — resetHistoryCollection', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page, {
+      allow_lists: [],
+      filter_lists: [],
+      category_lists: [],
+      domain_only_lists: []
+    })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('reset waits out an in-flight collection instead of silently skipping', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'https://www.example.com/waited', 'Waited', now - 1000)
+
+    // Simulate a collection in flight, then release it shortly after.
+    await page.evaluate(() => {
+      const plugin = (window as any).__historyPlugin
+      plugin.status.isCollecting = true
+      setTimeout(() => { plugin.status.isCollecting = false }, 700)
+    })
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const reset = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+    )
+    expect(reset.success).toBe(true)
+
+    const events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
+  })
+
+  test('reset rewinds the walk cursor so already-collected visits are re-emitted', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'https://www.example.com/revisit', 'Revisit', now - 1000)
+
+    // First pass collects the visit and advances the cursor to "now".
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    let events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
+
+    // A second ordinary trigger finds nothing new: the cursor has passed the visit.
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const trigger = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection' })
+    )
+    expect(trigger.success).toBe(true)
+    events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(0)
+
+    // Reset rewinds the cursor and re-collects the same visit.
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const reset = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+    )
+    expect(reset.success).toBe(true)
+    events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
   })
 })
