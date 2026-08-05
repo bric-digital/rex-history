@@ -11468,20 +11468,38 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           } else {
             allowCheck = await this.checkAllowLists(item.url);
             if (!allowCheck.allowed) {
-              recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
-              recordedTitle = "";
-              registeredDomain = "";
-              await this.maybeLogFilteredUrlDebug(
-                item.url,
-                recordedUrl,
-                "NOT_ON_ALLOWLIST",
-                void 0,
-                {
+              if (this.config?.not_on_allowlist_behavior === "domain_only") {
+                const filterResult = await this.applyFilterLists(item.url, {
                   visit_id: visit.visitId,
                   visit_time: visit.visitTime,
                   history_item_id: item.id
+                });
+                if (filterResult.filteredByList) {
+                  recordedUrl = filterResult.recordedUrl;
+                  recordedTitle = "";
+                  registeredDomain = "";
+                  filteredByList = filterResult.filteredByList;
+                  filterMatch = filterResult.filterMatch;
+                } else {
+                  recordedUrl = "DOMAIN ONLY";
+                  recordedTitle = "DOMAIN ONLY";
                 }
-              );
+              } else {
+                recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
+                recordedTitle = "";
+                registeredDomain = "";
+                await this.maybeLogFilteredUrlDebug(
+                  item.url,
+                  recordedUrl,
+                  "NOT_ON_ALLOWLIST",
+                  void 0,
+                  {
+                    visit_id: visit.visitId,
+                    visit_time: visit.visitTime,
+                    history_item_id: item.id
+                  }
+                );
+              }
             } else {
               const filterResult = await this.applyFilterLists(item.url, {
                 visit_id: visit.visitId,
@@ -11837,6 +11855,25 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       });
       return true;
     }
+    if (message.messageType === "resetHistoryCollection") {
+      console.log("[rex-history] Resetting collection cursor and re-collecting (eager)");
+      const waitForIdle = () => {
+        if (this.status.isCollecting === false) {
+          return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            waitForIdle().then(resolve);
+          }, 250);
+        });
+      };
+      waitForIdle().then(() => globalThis.chrome.storage.local.remove("webmunkHistoryLastFetch")).then(() => this.collectHistory(true)).then(() => {
+        sendResponse({ success: true });
+      }).catch((error) => {
+        sendResponse({ success: false, error: error.message });
+      });
+      return true;
+    }
     if (message.messageType === "getHistoryStatus") {
       console.log("[rex-history] Sending status:", this.status);
       sendResponse(this.status);
@@ -11848,6 +11885,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       const lookbackMs = lookbackDays * 24 * 60 * 60 * 1e3;
       globalThis.chrome.history.search({ text: "", startTime: 0, maxResults: 1e4 }).then((items) => {
         if (items.length === 0) {
+          console.log("[rex-history] getOldestHistoryAge: no history items found, ageSeconds=null");
           sendResponse({ ageSeconds: null });
           return;
         }
@@ -11862,12 +11900,23 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
               (min, item) => Math.min(min, item.lastVisitTime ?? oldestVisitTime),
               oldestVisitTime
             );
-            sendResponse({ ageSeconds: (Date.now() - oldest) / 1e3 });
-          }).catch(() => sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 }));
+            const ageSeconds = (Date.now() - oldest) / 1e3;
+            console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldest).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`);
+            sendResponse({ ageSeconds });
+          }).catch((error) => {
+            const ageSeconds = (Date.now() - oldestVisitTime) / 1e3;
+            console.warn("[rex-history] getOldestHistoryAge: second-page search failed, falling back to first-page oldest:", error);
+            sendResponse({ ageSeconds });
+          });
         } else {
-          sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 });
+          const ageSeconds = (Date.now() - oldestVisitTime) / 1e3;
+          console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldestVisitTime).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`);
+          sendResponse({ ageSeconds });
         }
-      }).catch(() => sendResponse({ ageSeconds: null }));
+      }).catch((error) => {
+        console.warn("[rex-history] getOldestHistoryAge: history search failed, ageSeconds=null:", error);
+        sendResponse({ ageSeconds: null });
+      });
       return true;
     }
     console.log("[rex-history] Unknown message type, not handling");
