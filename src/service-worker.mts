@@ -461,7 +461,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    */
   private async getInstallTime(): Promise<number | null> {
     try {
-      const response = await chrome.runtime.sendMessage({ messageType: 'getInstallTime' })
+      // Ask rex-core's plugin directly: a service worker cannot
+      // chrome.runtime.sendMessage to itself, so the message API is only for
+      // other extension contexts.
+      const response = await new Promise<unknown>((resolve) => {
+        const handled = rexCorePlugin.handleMessage({ messageType: 'getInstallTime' }, null, resolve)
+
+        if (handled !== true) {
+          resolve(null)
+        }
+      })
+
       return typeof response === 'number' ? response : null
     } catch (error) {
       console.error('[rex-history] Failed to get install time from rex-core:', error)
