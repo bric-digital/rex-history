@@ -1750,5 +1750,11 @@ test.describe('HistoryServiceWorkerModule — resetHistoryCollection', () => {
       () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
     )
     expect(events.length).toBe(1)
+
+    // The items counter restarts at zero on reset instead of accumulating.
+    const status = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'getHistoryStatus' })
+    )
+    expect(status.itemsCollected).toBe(1)
   })
 })

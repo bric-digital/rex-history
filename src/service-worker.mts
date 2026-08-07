@@ -1410,6 +1410,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
       waitForIdle()
         .then(() => chrome.storage.local.remove('webmunkHistoryLastFetch'))
+        .then(() => {
+          // A reset restarts the count from zero; leaving the lifetime tally
+          // makes a rescan look like it doubled the collected items.
+          this.status.itemsCollected = 0
+          return this.saveStatus()
+        })
         .then(() => this.collectHistory(true))
         .then(() => {
           sendResponse({ success: true })
