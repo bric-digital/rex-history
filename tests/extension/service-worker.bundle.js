@@ -11173,7 +11173,12 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
    */
   async getInstallTime() {
     try {
-      const response = await globalThis.chrome.runtime.sendMessage({ messageType: "getInstallTime" });
+      const response = await new Promise((resolve) => {
+        const handled = service_worker_default.handleMessage({ messageType: "getInstallTime" }, null, resolve);
+        if (handled !== true) {
+          resolve(null);
+        }
+      });
       return typeof response === "number" ? response : null;
     } catch (error) {
       console.error("[rex-history] Failed to get install time from rex-core:", error);
