@@ -11867,7 +11867,10 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
           }, 250);
         });
       };
-      waitForIdle().then(() => globalThis.chrome.storage.local.remove("webmunkHistoryLastFetch")).then(() => this.collectHistory(true)).then(() => {
+      waitForIdle().then(() => globalThis.chrome.storage.local.remove("webmunkHistoryLastFetch")).then(() => {
+        this.status.itemsCollected = 0;
+        return this.saveStatus();
+      }).then(() => this.collectHistory(true)).then(() => {
         sendResponse({ success: true });
       }).catch((error) => {
         sendResponse({ success: false, error: error.message });
