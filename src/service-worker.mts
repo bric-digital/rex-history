@@ -65,6 +65,16 @@ const DEFAULT_WALK_BUDGET_MS = 20000
 // that still overflows the page is collected best-effort (overflow escape
 // hatch) rather than split further — the walk must never wedge on one hot hour.
 const MIN_WINDOW_MS = 60000
+
+interface WindowWalkResult {
+  collectedCount: number;
+  /**
+   * Everything in [windowStart, advancedTo) is fully collected and safe to
+   * persist as the cursor. advancedTo < windowEnd means the deadline was hit
+   * partway through the window.
+   */
+  advancedTo: number;
+}
 // Durable marker written immediately BEFORE the uncapped overflow fetch+process,
 // cleared immediately after it succeeds. If a pathological minute (e.g. tens of
 // thousands of same-timestamp dumped visits) makes that uncapped batch exceed
@@ -619,10 +629,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * older visits and never finished on heavy histories.
    *
    * Per-wake the walk is bounded by a wall-clock budget (MV3 worker-lifetime
-   * guard). When the budget is hit before catching up to now, it emits a
-   * progress event and yields: a periodic alarm resumes next cycle; an eager
-   * (offboarding) walk re-arms an immediate alarm to continue back-to-back.
-   * collection-complete fires only when the cursor actually reaches ~now.
+   * guard), enforced between windows and, inside a split window, between
+   * sub-windows. Each fully-closed sub-window persists the cursor, so a
+   * worker killed mid-window resumes at most one leaf back. When the budget
+   * is hit before catching up to now, it emits a progress event and yields:
+   * a periodic alarm resumes next cycle; an eager (offboarding) walk re-arms
+   * an immediate alarm to continue back-to-back. collection-complete fires
+   * only when the cursor actually reaches ~now.
    */
   private async runCollectionCycle(eager: boolean): Promise<void> {
     const cycleNow = Date.now()
@@ -645,10 +658,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
 
       const windowEnd = Math.min(cursor + windowMs, cycleNow)
-      collectedCount += await this.collectWindow(cursor, windowEnd)
-      cursor = windowEnd
-      // Persist after every closed window so a worker killed mid-walk resumes
-      // exactly here on the next alarm rather than re-walking from the seed.
+      const result = await this.collectWindow(cursor, windowEnd, deadline)
+      collectedCount += result.collectedCount
+      cursor = result.advancedTo
+      // Persist after every closed sub-window run so a worker killed mid-walk
+      // resumes exactly here on the next alarm rather than re-walking from the
+      // window start.
       await this.setLastFetchTime(cursor)
       windowsThisWake++
     }
@@ -692,9 +707,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * full page it holds more URLs than one page can safely carry: split it toward
    * MIN_WINDOW_MS. A sub-MIN_WINDOW_MS window that still overflows is collected
    * best-effort and a privacy-safe overflow diagnostic is emitted — the walk
-   * never wedges on one abnormally heavy stretch. Returns visits collected.
+   * never wedges on one abnormally heavy stretch. Returns visits collected and
+   * how far the window is durably closed (`advancedTo`); `advancedTo <
+   * windowEnd` means the deadline was hit between sub-windows.
    */
-  private async collectWindow(windowStart: number, windowEnd: number): Promise<number> {
+  private async collectWindow(windowStart: number, windowEnd: number, deadline: number): Promise<WindowWalkResult> {
     const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
     const historyItems = await chrome.history.search({
@@ -707,11 +724,26 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (historyItems.length >= pageSize) {
       const span = windowEnd - windowStart
       if (span > MIN_WINDOW_MS) {
-        // Split the window and process the halves in order.
+        // Split the window and process the halves in order. Persisting the
+        // boundary after the first half closes means a worker killed in the
+        // second half resumes at mid instead of re-walking (and re-uploading)
+        // the whole window — the wedge observed in the field on dense
+        // histories. Checking the deadline between halves keeps one wake's
+        // work bounded while still guaranteeing at least one leaf of progress.
         const mid = windowStart + Math.floor(span / 2)
-        const first = await this.collectWindow(windowStart, mid)
-        const second = await this.collectWindow(mid, windowEnd)
-        return first + second
+        const first = await this.collectWindow(windowStart, mid, deadline)
+        if (first.advancedTo < mid) {
+          return first
+        }
+        await this.setLastFetchTime(mid)
+        if (Date.now() >= deadline) {
+          return { collectedCount: first.collectedCount, advancedTo: mid }
+        }
+        const second = await this.collectWindow(mid, windowEnd, deadline)
+        return {
+          collectedCount: first.collectedCount + second.collectedCount,
+          advancedTo: second.advancedTo
+        }
       }
       // Floor reached and still over-full (e.g. a cluster of same-timestamp
       // visits). Re-fetch this minute uncapped so NO item is dropped, flag it,
@@ -736,11 +768,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       // Survived the uncapped batch — clear the marker so a later worker start
       // does not mistake this window for a crash.
       await chrome.storage.local.remove(OVERFLOW_MARKER_KEY)
-      return overflowResult.collectedCount
+      return { collectedCount: overflowResult.collectedCount, advancedTo: windowEnd }
     }
 
     const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd)
-    return batchResult.collectedCount
+    return { collectedCount: batchResult.collectedCount, advancedTo: windowEnd }
   }
 
   /**

@@ -1596,3 +1596,142 @@ test.describe('HistoryServiceWorkerModule — Cursor write failure diagnostic', 
     expect(typeof details.attempted_cursor).toBe('number')
   })
 })
+
+/**
+ * Shared setup for the sub-window walk suites: fresh page, real module,
+ * 1h windows and a page size of 4 so a 12-item hour splits into 15-min leaves.
+ */
+async function setupWalkTest(
+  page: import('@playwright/test').Page,
+  overrides: Record<string, unknown> = {}
+) {
+  await page.goto('/test-page.html')
+  await waitForModuleSetup(page)
+  await seedConfigAndIdentifier(page, {
+    collection_window_hours: 1,
+    collection_page_size: 4,
+    lookback_days: 1,
+    ...overrides
+  })
+  await page.evaluate(async () => {
+    await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+  })
+  await page.waitForFunction(
+    () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+    { timeout: 5_000 }
+  )
+}
+
+/** Seed 12 visits spread across [windowStart, windowStart+1h) and park the cursor. */
+async function seedDenseWindow(page: import('@playwright/test').Page, windowStart: number) {
+  for (let i = 0; i < 12; i++) {
+    await addHistoryItem(page, `https://site${i}.example.com/`, `Site ${i}`, windowStart + i * 5 * 60 * 1000)
+  }
+  await page.evaluate(async (windowStart) => {
+    const data = (window as any).chrome.storage.local._data
+    data.webmunkHistoryLastFetch = windowStart
+    await window.chrome.storage.local.set(data)
+    ;(window as any).__capturedEvents = []
+  }, windowStart)
+}
+
+test.describe('HistoryServiceWorkerModule — Sub-window cursor persistence', () => {
+  /**
+   * Field defect (Keystone main study, participant b55f8b24, Sep 2026): the
+   * cursor persisted only when a whole window closed and the first window per
+   * wake was exempt from the budget, so a window too heavy to finish inside
+   * one MV3 worker lifetime was retried from scratch every wake forever,
+   * re-uploading its partial work each time (762 unique visits, 6,358 rows).
+   * The walk must instead persist each fully-closed sub-window and yield at
+   * the deadline between sub-windows, so any resume point is at worst one
+   * leaf behind.
+   */
+  const HOUR = 60 * 60 * 1000
+
+  test('a zero-budget wake yields mid-window at a sub-window boundary', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    const windowEnd = windowStart + HOUR
+    await seedDenseWindow(page, windowStart)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Pre-fix behavior: the first window is atomic and budget-exempt, so the
+    // cursor lands exactly at windowEnd. The yield must stop strictly inside.
+    expect(cursor).toBeGreaterThan(windowStart)
+    expect(cursor).toBeLessThan(windowEnd)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Premise: collection actually ran and processed the first leaf.
+    expect(events.filter((e) => e.name === 'rex-history-visit').length).toBeGreaterThan(0)
+    // A partial window is progress, not completion.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-progress').length).toBe(1)
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-complete').length).toBe(0)
+  })
+
+  test('closing a split window persists sub-window boundaries as it goes', async ({ page }) => {
+    await setupWalkTest(page) // default 20s budget: the window closes in one wake
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    const windowEnd = windowStart + HOUR
+    await seedDenseWindow(page, windowStart)
+
+    // Spy on cursor writes through the same API the module uses. The durable
+    // artifact of this fix IS the interior write: a worker killed mid-window
+    // resumes from the last one instead of re-walking the whole window.
+    await page.evaluate(() => {
+      const store = (window as any).chrome.storage.local
+      const orig = store.set.bind(store)
+      ;(window as any).__cursorWrites = []
+      store.set = (items: Record<string, unknown>) => {
+        if (items && 'webmunkHistoryLastFetch' in items) {
+          ;(window as any).__cursorWrites.push(items.webmunkHistoryLastFetch)
+        }
+        return orig(items)
+      }
+    })
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const writes = await page.evaluate(() => (window as any).__cursorWrites as number[])
+    const interior = writes.filter((w) => w > windowStart && w < windowEnd)
+    // Pre-fix behavior wrote only whole-window boundaries, so this was empty.
+    expect(interior.length).toBeGreaterThan(0)
+  })
+
+  test('a resumed walk collects each visit exactly once', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    await seedDenseWindow(page, windowStart)
+
+    // Zero budget forces one sub-window unit per wake; fire wakes until the
+    // walk reports completion. Guards both halves of the half-open contract:
+    // nothing double-collected at resume boundaries, nothing dropped.
+    for (let i = 0; i < 20; i++) {
+      await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+      await waitForCollectionComplete(page)
+      const done = await page.evaluate(() =>
+        ((window as any).__capturedEvents as Record<string, unknown>[])
+          .some((e) => e.event_name === 'rex-history-collection-complete'))
+      if (done) break
+    }
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Premise: the walk actually finished within the wake allowance.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-complete').length).toBeGreaterThan(0)
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    expect(urls.length).toBe(12)
+    expect(new Set(urls).size).toBe(12)
+  })
+})
