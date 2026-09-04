@@ -545,6 +545,29 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
+  private emitCollectionErrorDiagnostic(error: unknown): void {
+    try {
+      let errorName = 'unknown'
+      let errorMessage = String(error)
+      if (error instanceof Error) {
+        errorName = error.name
+        errorMessage = error.message
+      }
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-error',
+        event_details: {
+          error_name: errorName,
+          error_message: errorMessage,
+          date: Date.now()
+        }
+      })
+    } catch (diagnosticError) {
+      // A diagnostic must never become a new failure path.
+      console.error('[rex-history] Failed to emit rex-history-collection-error diagnostic:', diagnosticError)
+    }
+  }
+
   collectHistory(eager = false): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
@@ -590,9 +613,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         console.error('[rex-history] Collection error:', error)
-        // Even on failure, record that we attempted a fetch so operators/tests can
-        // see activity and avoid "undefined" last-fetch state.
-        return this.setLastFetchTime(Date.now())
+        // The cursor stays where the walk durably got to: moving it would
+        // silently discard the unwalked range. Surface the error server-side
+        // instead, where until now it reached only the participant's console.
+        this.emitCollectionErrorDiagnostic(error)
       })
       .finally(() => {
         this.status.isCollecting = false

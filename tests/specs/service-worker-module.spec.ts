@@ -1829,3 +1829,54 @@ test.describe('HistoryServiceWorkerModule — Stuck-window skip', () => {
     expect(record.cursor).toBe(parked)
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Collection error leaves the cursor alone', () => {
+  /**
+   * The catch in collectHistory wrote the cursor to Date.now() on any error.
+   * Since the windowed walk, that key IS the cursor ("everything before it is
+   * collected"), so one transient error silently discarded the entire
+   * unwalked range. An error must leave the cursor at the last durable
+   * position and surface server-side instead — errors previously reached
+   * only the participant's console.
+   */
+  const HOUR = 60 * 60 * 1000
+
+  test('a thrown search error keeps the cursor parked and emits rex-history-collection-error', async ({ page }) => {
+    await setupWalkTest(page)
+    const now = Date.now()
+    const parked = now - 3 * HOUR
+
+    await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+      ;(window as any).chrome.history.search = () => { throw new Error('SEARCH_BROKEN') }
+    }, parked)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+
+    // The diagnostic is the completion signal on the error path (the cycle
+    // never reaches lastCollectionTime), and it doubles as the premise check:
+    // it proves the error path actually ran, so the cursor assertion below
+    // cannot pass vacuously.
+    await page.waitForFunction(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[])
+        .some((e) => e.event_name === 'rex-history-collection-error'),
+      { timeout: 10_000 }
+    )
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const errs = events.filter((e) => e.event_name === 'rex-history-collection-error')
+    expect(errs.length).toBe(1)
+    expect((errs[0]!.event_details as Record<string, unknown>).error_message).toBe('SEARCH_BROKEN')
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Pre-fix behavior: cursor jumped to ~now, silently skipping 3 hours.
+    expect(cursor).toBe(parked)
+  })
+})

@@ -11231,6 +11231,27 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to emit rex-history-cursor-write-failed diagnostic:", diagnosticError);
     }
   }
+  emitCollectionErrorDiagnostic(error) {
+    try {
+      let errorName = "unknown";
+      let errorMessage = String(error);
+      if (error instanceof Error) {
+        errorName = error.name;
+        errorMessage = error.message;
+      }
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-collection-error",
+        event_details: {
+          error_name: errorName,
+          error_message: errorMessage,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-collection-error diagnostic:", diagnosticError);
+    }
+  }
   collectHistory(eager = false) {
     if (this.status.isCollecting) {
       console.log("[rex-history] Collection already in progress, skipping");
@@ -11259,7 +11280,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         return;
       }
       console.error("[rex-history] Collection error:", error);
-      return this.setLastFetchTime(Date.now());
+      this.emitCollectionErrorDiagnostic(error);
     }).finally(() => {
       this.status.isCollecting = false;
       return this.saveStatus().finally(() => {
