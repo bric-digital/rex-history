@@ -1596,3 +1596,287 @@ test.describe('HistoryServiceWorkerModule — Cursor write failure diagnostic', 
     expect(typeof details.attempted_cursor).toBe('number')
   })
 })
+
+/**
+ * Shared setup for the sub-window walk suites: fresh page, real module,
+ * 1h windows and a page size of 4 so a 12-item hour splits into 15-min leaves.
+ */
+async function setupWalkTest(
+  page: import('@playwright/test').Page,
+  overrides: Record<string, unknown> = {}
+) {
+  await page.goto('/test-page.html')
+  await waitForModuleSetup(page)
+  await seedConfigAndIdentifier(page, {
+    collection_window_hours: 1,
+    collection_page_size: 4,
+    lookback_days: 1,
+    ...overrides
+  })
+  await page.evaluate(async () => {
+    await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+  })
+  await page.waitForFunction(
+    () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+    { timeout: 5_000 }
+  )
+}
+
+/** Seed 12 visits spread across [windowStart, windowStart+1h) and park the cursor. */
+async function seedDenseWindow(page: import('@playwright/test').Page, windowStart: number) {
+  for (let i = 0; i < 12; i++) {
+    await addHistoryItem(page, `https://site${i}.example.com/`, `Site ${i}`, windowStart + i * 5 * 60 * 1000)
+  }
+  await page.evaluate(async (windowStart) => {
+    const data = (window as any).chrome.storage.local._data
+    data.webmunkHistoryLastFetch = windowStart
+    await window.chrome.storage.local.set(data)
+    ;(window as any).__capturedEvents = []
+  }, windowStart)
+}
+
+test.describe('HistoryServiceWorkerModule — Sub-window cursor persistence', () => {
+  /**
+   * Field defect (Keystone main study, participant b55f8b24, Sep 2026): the
+   * cursor persisted only when a whole window closed and the first window per
+   * wake was exempt from the budget, so a window too heavy to finish inside
+   * one MV3 worker lifetime was retried from scratch every wake forever,
+   * re-uploading its partial work each time (762 unique visits, 6,358 rows).
+   * The walk must instead persist each fully-closed sub-window and yield at
+   * the deadline between sub-windows, so any resume point is at worst one
+   * leaf behind.
+   */
+  const HOUR = 60 * 60 * 1000
+
+  test('a zero-budget wake yields mid-window at a sub-window boundary', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    const windowEnd = windowStart + HOUR
+    await seedDenseWindow(page, windowStart)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Pre-fix behavior: the first window is atomic and budget-exempt, so the
+    // cursor lands exactly at windowEnd. The yield must stop strictly inside.
+    expect(cursor).toBeGreaterThan(windowStart)
+    expect(cursor).toBeLessThan(windowEnd)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Premise: collection actually ran and processed the first leaf.
+    expect(events.filter((e) => e.name === 'rex-history-visit').length).toBeGreaterThan(0)
+    // A partial window is progress, not completion.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-progress').length).toBe(1)
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-complete').length).toBe(0)
+  })
+
+  test('closing a split window persists sub-window boundaries as it goes', async ({ page }) => {
+    await setupWalkTest(page) // default 20s budget: the window closes in one wake
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    const windowEnd = windowStart + HOUR
+    await seedDenseWindow(page, windowStart)
+
+    // Spy on cursor writes through the same API the module uses. The durable
+    // artifact of this fix IS the interior write: a worker killed mid-window
+    // resumes from the last one instead of re-walking the whole window.
+    await page.evaluate(() => {
+      const store = (window as any).chrome.storage.local
+      const orig = store.set.bind(store)
+      ;(window as any).__cursorWrites = []
+      store.set = (items: Record<string, unknown>) => {
+        if (items && 'webmunkHistoryLastFetch' in items) {
+          ;(window as any).__cursorWrites.push(items.webmunkHistoryLastFetch)
+        }
+        return orig(items)
+      }
+    })
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const writes = await page.evaluate(() => (window as any).__cursorWrites as number[])
+    const interior = writes.filter((w) => w > windowStart && w < windowEnd)
+    // Pre-fix behavior wrote only whole-window boundaries, so this was empty.
+    expect(interior.length).toBeGreaterThan(0)
+  })
+
+  test('a resumed walk collects each visit exactly once', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    const now = Date.now()
+    const windowStart = now - 2 * HOUR
+    await seedDenseWindow(page, windowStart)
+
+    // Zero budget forces one sub-window unit per wake; fire wakes until the
+    // walk reports completion. Guards both halves of the half-open contract:
+    // nothing double-collected at resume boundaries, nothing dropped.
+    for (let i = 0; i < 20; i++) {
+      await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+      await waitForCollectionComplete(page)
+      const done = await page.evaluate(() =>
+        ((window as any).__capturedEvents as Record<string, unknown>[])
+          .some((e) => e.event_name === 'rex-history-collection-complete'))
+      if (done) break
+    }
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Premise: the walk actually finished within the wake allowance.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-complete').length).toBeGreaterThan(0)
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    expect(urls.length).toBe(12)
+    expect(new Set(urls).size).toBe(12)
+  })
+})
+
+test.describe('HistoryServiceWorkerModule — Stuck-window skip', () => {
+  /**
+   * Defense in depth behind sub-window persistence: a wake that starts at the
+   * same cursor as the previous wake means that wake persisted nothing (killed
+   * before closing even one leaf). Past collection_max_window_attempts
+   * consecutive same-cursor starts, the walk skips one window — bounded loss,
+   * reported via rex-history-walk-stuck — instead of wedging forever, which in
+   * the field cost every visit from the wedge point onward.
+   */
+  const HOUR = 60 * 60 * 1000
+  const parkedOffset = 3 * HOUR
+
+  async function seedStuckScenario(page: import('@playwright/test').Page, attempts: number, attemptCursorOffset = 0) {
+    const now = Date.now()
+    const parked = now - parkedOffset
+    // One visit inside the first window at the parked cursor, one in the next.
+    await addHistoryItem(page, 'https://poison.example.com/', 'Poison', parked + 10 * 60 * 1000)
+    await addHistoryItem(page, 'https://healthy.example.com/', 'Healthy', parked + 90 * 60 * 1000)
+    await page.evaluate(async ({ parked, attempts, attemptCursorOffset }) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      data.webmunkHistoryWalkAttempt = {
+        cursor: parked + attemptCursorOffset,
+        attempts,
+        firstAttemptAt: parked
+      }
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, { parked, attempts, attemptCursorOffset })
+    return parked
+  }
+
+  test('after max same-cursor attempts the walk skips one window and reports it', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 5)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const stuck = events.filter((e) => e.event_name === 'rex-history-walk-stuck')
+    expect(stuck.length).toBe(1)
+    expect(stuck[0]!.name).toBe('pdk-app-event')
+    expect((stuck[0]!.event_details as Record<string, unknown>).skipped_to).toBe(parked + HOUR)
+
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    // The skipped window's visit is the bounded loss; the walk continued past it.
+    expect(urls).not.toContain('https://poison.example.com/')
+    expect(urls).toContain('https://healthy.example.com/')
+  })
+
+  test('below the attempt limit nothing is skipped and the counter increments', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 2)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    expect(events.filter((e) => e.event_name === 'rex-history-walk-stuck').length).toBe(0)
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    expect(urls).toContain('https://poison.example.com/')
+    expect(urls).toContain('https://healthy.example.com/')
+
+    const record = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryWalkAttempt as { cursor: number; attempts: number }
+    )
+    expect(record.attempts).toBe(3)
+    expect(record.cursor).toBe(parked)
+  })
+
+  test('a wake starting at a new cursor resets the attempt counter', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 4, -HOUR) // record points at a DIFFERENT cursor
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    expect(events.filter((e) => e.event_name === 'rex-history-walk-stuck').length).toBe(0)
+    const record = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryWalkAttempt as { cursor: number; attempts: number }
+    )
+    expect(record.attempts).toBe(1)
+    expect(record.cursor).toBe(parked)
+  })
+})
+
+test.describe('HistoryServiceWorkerModule — Collection error leaves the cursor alone', () => {
+  /**
+   * The catch in collectHistory wrote the cursor to Date.now() on any error.
+   * Since the windowed walk, that key IS the cursor ("everything before it is
+   * collected"), so one transient error silently discarded the entire
+   * unwalked range. An error must leave the cursor at the last durable
+   * position and surface server-side instead — errors previously reached
+   * only the participant's console.
+   */
+  const HOUR = 60 * 60 * 1000
+
+  test('a thrown search error keeps the cursor parked and emits rex-history-collection-error', async ({ page }) => {
+    await setupWalkTest(page)
+    const now = Date.now()
+    const parked = now - 3 * HOUR
+
+    await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+      ;(window as any).chrome.history.search = () => { throw new Error('SEARCH_BROKEN') }
+    }, parked)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+
+    // The diagnostic is the completion signal on the error path (the cycle
+    // never reaches lastCollectionTime), and it doubles as the premise check:
+    // it proves the error path actually ran, so the cursor assertion below
+    // cannot pass vacuously.
+    await page.waitForFunction(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[])
+        .some((e) => e.event_name === 'rex-history-collection-error'),
+      { timeout: 10_000 }
+    )
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const errs = events.filter((e) => e.event_name === 'rex-history-collection-error')
+    expect(errs.length).toBe(1)
+    expect((errs[0]!.event_details as Record<string, unknown>).error_message).toBe('SEARCH_BROKEN')
+
+    const cursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    // Pre-fix behavior: cursor jumped to ~now, silently skipping 3 hours.
+    expect(cursor).toBe(parked)
+  })
+})

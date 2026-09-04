@@ -37,12 +37,19 @@ interface HistoryConfig {
   collection_window_hours?: number;
   /**
    * Wall-clock budget (ms) for how long one alarm wake spends walking windows
-   * before yielding to the next alarm (MV3 worker-lifetime guard). The cursor
-   * is persisted after every closed window, so the next wake resumes cleanly.
-   * Default 20000 when unset. 0 means "one window per wake" (used in tests and
-   * as a hard floor — at least one window always runs).
+   * before yielding to the next alarm (MV3 worker-lifetime guard), checked
+   * between windows and between sub-windows of a split window. The cursor is
+   * persisted after every closed sub-window, so the next wake resumes cleanly.
+   * Default 20000 when unset. 0 means "one sub-window unit per wake" (used in
+   * tests and as a hard floor — at least one leaf always runs).
    */
   collection_walk_budget_ms?: number;
+  /**
+   * Consecutive worker wakes allowed to start at the same cursor before the
+   * walk concludes the window cannot be finished, skips it, and emits a
+   * rex-history-walk-stuck diagnostic. Default 5 when unset.
+   */
+  collection_max_window_attempts?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +72,18 @@ const DEFAULT_WALK_BUDGET_MS = 20000
 // that still overflows the page is collected best-effort (overflow escape
 // hatch) rather than split further — the walk must never wedge on one hot hour.
 const MIN_WINDOW_MS = 60000
+const DEFAULT_MAX_WINDOW_ATTEMPTS = 5
+const WALK_ATTEMPT_KEY = 'webmunkHistoryWalkAttempt'
+
+interface WindowWalkResult {
+  collectedCount: number;
+  /**
+   * Everything in [windowStart, advancedTo) is fully collected and safe to
+   * persist as the cursor. advancedTo < windowEnd means the deadline was hit
+   * partway through the window.
+   */
+  advancedTo: number;
+}
 // Durable marker written immediately BEFORE the uncapped overflow fetch+process,
 // cleared immediately after it succeeds. If a pathological minute (e.g. tens of
 // thousands of same-timestamp dumped visits) makes that uncapped batch exceed
@@ -526,6 +545,29 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
+  private emitCollectionErrorDiagnostic(error: unknown): void {
+    try {
+      let errorName = 'unknown'
+      let errorMessage = String(error)
+      if (error instanceof Error) {
+        errorName = error.name
+        errorMessage = error.message
+      }
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-collection-error',
+        event_details: {
+          error_name: errorName,
+          error_message: errorMessage,
+          date: Date.now()
+        }
+      })
+    } catch (diagnosticError) {
+      // A diagnostic must never become a new failure path.
+      console.error('[rex-history] Failed to emit rex-history-collection-error diagnostic:', diagnosticError)
+    }
+  }
+
   collectHistory(eager = false): Promise<void> {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
@@ -571,9 +613,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         console.error('[rex-history] Collection error:', error)
-        // Even on failure, record that we attempted a fetch so operators/tests can
-        // see activity and avoid "undefined" last-fetch state.
-        return this.setLastFetchTime(Date.now())
+        // The cursor stays where the walk durably got to: moving it would
+        // silently discard the unwalked range. Surface the error server-side
+        // instead, where until now it reached only the participant's console.
+        this.emitCollectionErrorDiagnostic(error)
       })
       .finally(() => {
         this.status.isCollecting = false
@@ -619,10 +662,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * older visits and never finished on heavy histories.
    *
    * Per-wake the walk is bounded by a wall-clock budget (MV3 worker-lifetime
-   * guard). When the budget is hit before catching up to now, it emits a
-   * progress event and yields: a periodic alarm resumes next cycle; an eager
-   * (offboarding) walk re-arms an immediate alarm to continue back-to-back.
-   * collection-complete fires only when the cursor actually reaches ~now.
+   * guard), enforced between windows and, inside a split window, between
+   * sub-windows. Each fully-closed sub-window persists the cursor, so a
+   * worker killed mid-window resumes at most one leaf back. When the budget
+   * is hit before catching up to now, it emits a progress event and yields:
+   * a periodic alarm resumes next cycle; an eager (offboarding) walk re-arms
+   * an immediate alarm to continue back-to-back. collection-complete fires
+   * only when the cursor actually reaches ~now.
    */
   private async runCollectionCycle(eager: boolean): Promise<void> {
     const cycleNow = Date.now()
@@ -631,6 +677,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     const deadline = cycleNow + budgetMs
 
     let cursor = await this.getLastFetchTime()
+    cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs)
     console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`)
 
     let collectedCount = 0
@@ -645,10 +692,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
 
       const windowEnd = Math.min(cursor + windowMs, cycleNow)
-      collectedCount += await this.collectWindow(cursor, windowEnd)
-      cursor = windowEnd
-      // Persist after every closed window so a worker killed mid-walk resumes
-      // exactly here on the next alarm rather than re-walking from the seed.
+      const result = await this.collectWindow(cursor, windowEnd, deadline)
+      collectedCount += result.collectedCount
+      cursor = result.advancedTo
+      // Persist after every closed sub-window run so a worker killed mid-walk
+      // resumes exactly here on the next alarm rather than re-walking from the
+      // window start.
       await this.setLastFetchTime(cursor)
       windowsThisWake++
     }
@@ -688,13 +737,66 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
+   * Wedge breaker: a wake that starts at the same cursor as the previous wake
+   * means that wake persisted no progress (killed before closing one leaf).
+   * Count consecutive same-cursor starts durably; past the limit, skip one
+   * window and emit a server-visible diagnostic. Losing at most one window
+   * beats the field failure mode of losing everything from the wedge onward.
+   */
+  private async advancePastStuckWindow(cursor: number, cycleNow: number, windowMs: number): Promise<number> {
+    try {
+      const stored = await chrome.storage.local.get(WALK_ATTEMPT_KEY)
+      const attempt = stored[WALK_ATTEMPT_KEY] as
+        | { cursor: number; attempts: number; firstAttemptAt: number }
+        | undefined
+      const maxAttempts = this.config?.collection_max_window_attempts ?? DEFAULT_MAX_WINDOW_ATTEMPTS
+      const now = Date.now()
+
+      if (attempt === undefined || attempt.cursor !== cursor) {
+        await chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor, attempts: 1, firstAttemptAt: now } })
+        return cursor
+      }
+
+      if (attempt.attempts < maxAttempts) {
+        await chrome.storage.local.set({
+          [WALK_ATTEMPT_KEY]: { cursor, attempts: attempt.attempts + 1, firstAttemptAt: attempt.firstAttemptAt }
+        })
+        return cursor
+      }
+
+      const skippedTo = Math.min(cursor + windowMs, cycleNow)
+      console.error(`[rex-history] Walk stuck at ${new Date(cursor).toISOString()} after ${attempt.attempts} attempts — skipping to ${new Date(skippedTo).toISOString()}`)
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-walk-stuck',
+        event_details: {
+          cursor,
+          attempts: attempt.attempts,
+          first_attempt_at: attempt.firstAttemptAt,
+          skipped_to: skippedTo,
+          date: now
+        }
+      })
+      await this.setLastFetchTime(skippedTo)
+      await chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor: skippedTo, attempts: 1, firstAttemptAt: now } })
+      return skippedTo
+    } catch (error) {
+      // Bookkeeping must never become a new way to block collection.
+      console.error('[rex-history] Stuck-window bookkeeping failed:', error)
+      return cursor
+    }
+  }
+
+  /**
    * Collect every visit inside [windowStart, windowEnd). If the window returns a
    * full page it holds more URLs than one page can safely carry: split it toward
    * MIN_WINDOW_MS. A sub-MIN_WINDOW_MS window that still overflows is collected
    * best-effort and a privacy-safe overflow diagnostic is emitted — the walk
-   * never wedges on one abnormally heavy stretch. Returns visits collected.
+   * never wedges on one abnormally heavy stretch. Returns visits collected and
+   * how far the window is durably closed (`advancedTo`); `advancedTo <
+   * windowEnd` means the deadline was hit between sub-windows.
    */
-  private async collectWindow(windowStart: number, windowEnd: number): Promise<number> {
+  private async collectWindow(windowStart: number, windowEnd: number, deadline: number): Promise<WindowWalkResult> {
     const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE
 
     const historyItems = await chrome.history.search({
@@ -707,11 +809,26 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (historyItems.length >= pageSize) {
       const span = windowEnd - windowStart
       if (span > MIN_WINDOW_MS) {
-        // Split the window and process the halves in order.
+        // Split the window and process the halves in order. Persisting the
+        // boundary after the first half closes means a worker killed in the
+        // second half resumes at mid instead of re-walking (and re-uploading)
+        // the whole window — the wedge observed in the field on dense
+        // histories. Checking the deadline between halves keeps one wake's
+        // work bounded while still guaranteeing at least one leaf of progress.
         const mid = windowStart + Math.floor(span / 2)
-        const first = await this.collectWindow(windowStart, mid)
-        const second = await this.collectWindow(mid, windowEnd)
-        return first + second
+        const first = await this.collectWindow(windowStart, mid, deadline)
+        if (first.advancedTo < mid) {
+          return first
+        }
+        await this.setLastFetchTime(mid)
+        if (Date.now() >= deadline) {
+          return { collectedCount: first.collectedCount, advancedTo: mid }
+        }
+        const second = await this.collectWindow(mid, windowEnd, deadline)
+        return {
+          collectedCount: first.collectedCount + second.collectedCount,
+          advancedTo: second.advancedTo
+        }
       }
       // Floor reached and still over-full (e.g. a cluster of same-timestamp
       // visits). Re-fetch this minute uncapped so NO item is dropped, flag it,
@@ -736,11 +853,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       // Survived the uncapped batch — clear the marker so a later worker start
       // does not mistake this window for a crash.
       await chrome.storage.local.remove(OVERFLOW_MARKER_KEY)
-      return overflowResult.collectedCount
+      return { collectedCount: overflowResult.collectedCount, advancedTo: windowEnd }
     }
 
     const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd)
-    return batchResult.collectedCount
+    return { collectedCount: batchResult.collectedCount, advancedTo: windowEnd }
   }
 
   /**
