@@ -37,12 +37,19 @@ interface HistoryConfig {
   collection_window_hours?: number;
   /**
    * Wall-clock budget (ms) for how long one alarm wake spends walking windows
-   * before yielding to the next alarm (MV3 worker-lifetime guard). The cursor
-   * is persisted after every closed window, so the next wake resumes cleanly.
-   * Default 20000 when unset. 0 means "one window per wake" (used in tests and
-   * as a hard floor — at least one window always runs).
+   * before yielding to the next alarm (MV3 worker-lifetime guard), checked
+   * between windows and between sub-windows of a split window. The cursor is
+   * persisted after every closed sub-window, so the next wake resumes cleanly.
+   * Default 20000 when unset. 0 means "one sub-window unit per wake" (used in
+   * tests and as a hard floor — at least one leaf always runs).
    */
   collection_walk_budget_ms?: number;
+  /**
+   * Consecutive worker wakes allowed to start at the same cursor before the
+   * walk concludes the window cannot be finished, skips it, and emits a
+   * rex-history-walk-stuck diagnostic. Default 5 when unset.
+   */
+  collection_max_window_attempts?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +72,8 @@ const DEFAULT_WALK_BUDGET_MS = 20000
 // that still overflows the page is collected best-effort (overflow escape
 // hatch) rather than split further — the walk must never wedge on one hot hour.
 const MIN_WINDOW_MS = 60000
+const DEFAULT_MAX_WINDOW_ATTEMPTS = 5
+const WALK_ATTEMPT_KEY = 'webmunkHistoryWalkAttempt'
 
 interface WindowWalkResult {
   collectedCount: number;
@@ -644,6 +653,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     const deadline = cycleNow + budgetMs
 
     let cursor = await this.getLastFetchTime()
+    cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs)
     console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`)
 
     let collectedCount = 0
@@ -699,6 +709,57 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       if (eager) {
         this.rearmEagerAlarm()
       }
+    }
+  }
+
+  /**
+   * Wedge breaker: a wake that starts at the same cursor as the previous wake
+   * means that wake persisted no progress (killed before closing one leaf).
+   * Count consecutive same-cursor starts durably; past the limit, skip one
+   * window and emit a server-visible diagnostic. Losing at most one window
+   * beats the field failure mode of losing everything from the wedge onward.
+   */
+  private async advancePastStuckWindow(cursor: number, cycleNow: number, windowMs: number): Promise<number> {
+    try {
+      const stored = await chrome.storage.local.get(WALK_ATTEMPT_KEY)
+      const attempt = stored[WALK_ATTEMPT_KEY] as
+        | { cursor: number; attempts: number; firstAttemptAt: number }
+        | undefined
+      const maxAttempts = this.config?.collection_max_window_attempts ?? DEFAULT_MAX_WINDOW_ATTEMPTS
+      const now = Date.now()
+
+      if (attempt === undefined || attempt.cursor !== cursor) {
+        await chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor, attempts: 1, firstAttemptAt: now } })
+        return cursor
+      }
+
+      if (attempt.attempts < maxAttempts) {
+        await chrome.storage.local.set({
+          [WALK_ATTEMPT_KEY]: { cursor, attempts: attempt.attempts + 1, firstAttemptAt: attempt.firstAttemptAt }
+        })
+        return cursor
+      }
+
+      const skippedTo = Math.min(cursor + windowMs, cycleNow)
+      console.error(`[rex-history] Walk stuck at ${new Date(cursor).toISOString()} after ${attempt.attempts} attempts — skipping to ${new Date(skippedTo).toISOString()}`)
+      dispatchEvent({
+        name: 'pdk-app-event',
+        event_name: 'rex-history-walk-stuck',
+        event_details: {
+          cursor,
+          attempts: attempt.attempts,
+          first_attempt_at: attempt.firstAttemptAt,
+          skipped_to: skippedTo,
+          date: now
+        }
+      })
+      await this.setLastFetchTime(skippedTo)
+      await chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor: skippedTo, attempts: 1, firstAttemptAt: now } })
+      return skippedTo
+    } catch (error) {
+      // Bookkeeping must never become a new way to block collection.
+      console.error('[rex-history] Stuck-window bookkeeping failed:', error)
+      return cursor
     }
   }
 
