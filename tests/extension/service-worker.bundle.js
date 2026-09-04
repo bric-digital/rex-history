@@ -10892,6 +10892,8 @@ var DEFAULT_LOOKBACK_DAYS = 90;
 var DEFAULT_COLLECTION_WINDOW_HOURS = 1;
 var DEFAULT_WALK_BUDGET_MS = 2e4;
 var MIN_WINDOW_MS = 6e4;
+var DEFAULT_MAX_WINDOW_ATTEMPTS = 5;
+var WALK_ATTEMPT_KEY = "webmunkHistoryWalkAttempt";
 var OVERFLOW_MARKER_KEY = "webmunkHistoryOverflowMarker";
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
@@ -11309,6 +11311,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS;
     const deadline = cycleNow + budgetMs;
     let cursor = await this.getLastFetchTime();
+    cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs);
     console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`);
     let collectedCount = 0;
     let windowsThisWake = 0;
@@ -11348,6 +11351,50 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       if (eager) {
         this.rearmEagerAlarm();
       }
+    }
+  }
+  /**
+   * Wedge breaker: a wake that starts at the same cursor as the previous wake
+   * means that wake persisted no progress (killed before closing one leaf).
+   * Count consecutive same-cursor starts durably; past the limit, skip one
+   * window and emit a server-visible diagnostic. Losing at most one window
+   * beats the field failure mode of losing everything from the wedge onward.
+   */
+  async advancePastStuckWindow(cursor, cycleNow, windowMs) {
+    try {
+      const stored = await globalThis.chrome.storage.local.get(WALK_ATTEMPT_KEY);
+      const attempt = stored[WALK_ATTEMPT_KEY];
+      const maxAttempts = this.config?.collection_max_window_attempts ?? DEFAULT_MAX_WINDOW_ATTEMPTS;
+      const now = Date.now();
+      if (attempt === void 0 || attempt.cursor !== cursor) {
+        await globalThis.chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor, attempts: 1, firstAttemptAt: now } });
+        return cursor;
+      }
+      if (attempt.attempts < maxAttempts) {
+        await globalThis.chrome.storage.local.set({
+          [WALK_ATTEMPT_KEY]: { cursor, attempts: attempt.attempts + 1, firstAttemptAt: attempt.firstAttemptAt }
+        });
+        return cursor;
+      }
+      const skippedTo = Math.min(cursor + windowMs, cycleNow);
+      console.error(`[rex-history] Walk stuck at ${new Date(cursor).toISOString()} after ${attempt.attempts} attempts \u2014 skipping to ${new Date(skippedTo).toISOString()}`);
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-walk-stuck",
+        event_details: {
+          cursor,
+          attempts: attempt.attempts,
+          first_attempt_at: attempt.firstAttemptAt,
+          skipped_to: skippedTo,
+          date: now
+        }
+      });
+      await this.setLastFetchTime(skippedTo);
+      await globalThis.chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor: skippedTo, attempts: 1, firstAttemptAt: now } });
+      return skippedTo;
+    } catch (error) {
+      console.error("[rex-history] Stuck-window bookkeeping failed:", error);
+      return cursor;
     }
   }
   /**

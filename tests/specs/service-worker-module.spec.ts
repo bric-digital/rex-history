@@ -1735,3 +1735,97 @@ test.describe('HistoryServiceWorkerModule — Sub-window cursor persistence', ()
     expect(new Set(urls).size).toBe(12)
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Stuck-window skip', () => {
+  /**
+   * Defense in depth behind sub-window persistence: a wake that starts at the
+   * same cursor as the previous wake means that wake persisted nothing (killed
+   * before closing even one leaf). Past collection_max_window_attempts
+   * consecutive same-cursor starts, the walk skips one window — bounded loss,
+   * reported via rex-history-walk-stuck — instead of wedging forever, which in
+   * the field cost every visit from the wedge point onward.
+   */
+  const HOUR = 60 * 60 * 1000
+  const parkedOffset = 3 * HOUR
+
+  async function seedStuckScenario(page: import('@playwright/test').Page, attempts: number, attemptCursorOffset = 0) {
+    const now = Date.now()
+    const parked = now - parkedOffset
+    // One visit inside the first window at the parked cursor, one in the next.
+    await addHistoryItem(page, 'https://poison.example.com/', 'Poison', parked + 10 * 60 * 1000)
+    await addHistoryItem(page, 'https://healthy.example.com/', 'Healthy', parked + 90 * 60 * 1000)
+    await page.evaluate(async ({ parked, attempts, attemptCursorOffset }) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      data.webmunkHistoryWalkAttempt = {
+        cursor: parked + attemptCursorOffset,
+        attempts,
+        firstAttemptAt: parked
+      }
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, { parked, attempts, attemptCursorOffset })
+    return parked
+  }
+
+  test('after max same-cursor attempts the walk skips one window and reports it', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 5)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const stuck = events.filter((e) => e.event_name === 'rex-history-walk-stuck')
+    expect(stuck.length).toBe(1)
+    expect(stuck[0]!.name).toBe('pdk-app-event')
+    expect((stuck[0]!.event_details as Record<string, unknown>).skipped_to).toBe(parked + HOUR)
+
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    // The skipped window's visit is the bounded loss; the walk continued past it.
+    expect(urls).not.toContain('https://poison.example.com/')
+    expect(urls).toContain('https://healthy.example.com/')
+  })
+
+  test('below the attempt limit nothing is skipped and the counter increments', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 2)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    expect(events.filter((e) => e.event_name === 'rex-history-walk-stuck').length).toBe(0)
+    const urls = events.filter((e) => e.name === 'rex-history-visit').map((e) => e.url as string)
+    expect(urls).toContain('https://poison.example.com/')
+    expect(urls).toContain('https://healthy.example.com/')
+
+    const record = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryWalkAttempt as { cursor: number; attempts: number }
+    )
+    expect(record.attempts).toBe(3)
+    expect(record.cursor).toBe(parked)
+  })
+
+  test('a wake starting at a new cursor resets the attempt counter', async ({ page }) => {
+    await setupWalkTest(page)
+    const parked = await seedStuckScenario(page, 4, -HOUR) // record points at a DIFFERENT cursor
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    expect(events.filter((e) => e.event_name === 'rex-history-walk-stuck').length).toBe(0)
+    const record = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryWalkAttempt as { cursor: number; attempts: number }
+    )
+    expect(record.attempts).toBe(1)
+    expect(record.cursor).toBe(parked)
+  })
+})
