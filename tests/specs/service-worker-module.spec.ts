@@ -1880,3 +1880,134 @@ test.describe('HistoryServiceWorkerModule — Collection error leaves the cursor
     expect(cursor).toBe(parked)
   })
 })
+
+test.describe('HistoryServiceWorkerModule — Per-walk visit cache', () => {
+  /**
+   * Field defect (WebEatsItself pilot, 0.0.43, Sep 2026): a participant with a
+   * self-refreshing dashboard (441,778 visits on one URL) saw ~10s of lag on
+   * every page load and uninstalled after 15 minutes.
+   *
+   * chrome.history.getVisits takes no time range — it returns every visit a URL
+   * has ever had — and the windowed walk calls it once per URL per window, then
+   * discards the visits outside that window. A URL present in every window is
+   * therefore materialised in full once per window, and one such call costs
+   * 1.3-1.5s inside the service worker. The walk spent its entire wall-clock
+   * budget refetching the same two URLs.
+   *
+   * A URL's visit list is identical for every window in one walk, so fetch it
+   * once per walk and serve each window from that. Emission is unchanged: the
+   * per-window filter still decides what is emitted and when.
+   */
+  const HOUR = 60 * 60 * 1000
+  const REPEATED_URL = 'https://dashboard.example.com/'
+
+  /** Install a counting wrapper around getVisits, keyed by URL. */
+  async function countGetVisits(page: import('@playwright/test').Page) {
+    await page.evaluate(() => {
+      const history = (window as any).chrome.history
+      const original = history.getVisits.bind(history)
+      ;(window as any).__getVisitsCalls = []
+      history.getVisits = async ({ url }: { url: string }) => {
+        ;(window as any).__getVisitsCalls.push(url)
+        return original({ url })
+      }
+    })
+  }
+
+  async function callsFor(page: import('@playwright/test').Page, url: string) {
+    const calls = await page.evaluate(() => (window as any).__getVisitsCalls as string[])
+    return calls.filter((u) => u === url).length
+  }
+
+  /** One URL visited once per hour across `hours` consecutive windows. */
+  async function seedRepeatedUrl(
+    page: import('@playwright/test').Page,
+    firstVisit: number,
+    hours: number
+  ) {
+    await page.evaluate(({ url, firstVisit, hours, HOUR }) => {
+      const visits = []
+      for (let i = 0; i < hours; i++) {
+        visits.push({ visitId: String(100 + i), visitTime: firstVisit + i * HOUR, transition: 'link' })
+      }
+      ;(window as any).chrome.history._items.push({
+        id: 'repeated-item',
+        url,
+        title: 'Dashboard',
+        lastVisitTime: firstVisit + (hours - 1) * HOUR,
+        visitCount: hours,
+        typedCount: 0,
+        _visits: visits
+      })
+    }, { url: REPEATED_URL, firstVisit, hours, HOUR })
+  }
+
+  test('a URL spanning several windows is fetched once for the whole walk', async ({ page }) => {
+    await setupWalkTest(page)
+    const now = Date.now()
+    const parked = now - 4 * HOUR
+    // A visit in each of the first three windows the walk will cross.
+    await seedRepeatedUrl(page, parked + 60_000, 3)
+
+    await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, parked)
+    await countGetVisits(page)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Premise: the walk actually crossed all three windows and emitted every
+    // visit. Without this the call-count assertion could pass by collecting
+    // nothing at all.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-complete').length).toBe(1)
+    const emitted = events.filter((e) => e.name === 'rex-history-visit' && e.url === REPEATED_URL)
+    expect(emitted.length).toBe(3)
+    expect(new Set(emitted.map((e) => e.visit_id)).size).toBe(3)
+
+    // Pre-fix behavior: one call per window the URL appears in, so 3.
+    expect(await callsFor(page, REPEATED_URL)).toBe(1)
+  })
+
+  test('a later wake sees visits added after the previous wake cached the URL', async ({ page }) => {
+    await setupWalkTest(page)
+    const now = Date.now()
+    const parked = now - 4 * HOUR
+    await seedRepeatedUrl(page, parked + 60_000, 2)
+
+    await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, parked)
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    // The cache must not outlive the walk: a visit recorded afterwards has to
+    // be collected by the next wake, not masked by a stale cached array.
+    await page.evaluate(({ url, when }) => {
+      const item = (window as any).chrome.history._items.find((i: any) => i.url === url)
+      item._visits.push({ visitId: '999', visitTime: when, transition: 'link' })
+      item.lastVisitTime = when
+      item.visitCount = item._visits.length
+      ;(window as any).__capturedEvents = []
+    }, { url: REPEATED_URL, when: Date.now() })
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    const emitted = events.filter((e) => e.name === 'rex-history-visit' && e.url === REPEATED_URL)
+    expect(emitted.map((e) => e.visit_id)).toContain('999')
+  })
+})

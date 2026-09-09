@@ -10894,6 +10894,7 @@ var DEFAULT_WALK_BUDGET_MS = 2e4;
 var MIN_WINDOW_MS = 6e4;
 var DEFAULT_MAX_WINDOW_ATTEMPTS = 5;
 var WALK_ATTEMPT_KEY = "webmunkHistoryWalkAttempt";
+var DEFAULT_VISIT_CACHE_MAX_VISITS = 5e5;
 var OVERFLOW_MARKER_KEY = "webmunkHistoryOverflowMarker";
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
@@ -10925,6 +10926,23 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
      * By coalescing overlapping calls into a single promise we avoid the race.
      */
     __publicField(this, "loadConfigurationPromise", null);
+    /**
+     * A walk's visit lists, keyed by URL.
+     *
+     * chrome.history.getVisits takes no time range, so it returns every visit a
+     * URL has ever had no matter which window asked. The windowed walk sees the
+     * same URL once per window it has a visit in, and a URL that is revisited
+     * continuously appears in all of them: a self-refreshing dashboard cost one
+     * full fetch of 441,778 visits per window, at 1.3-1.5s each, which consumed
+     * the whole wall-clock budget before any window closed.
+     *
+     * The list a window needs is the same list every other window in the walk
+     * needs, so it is fetched once and held for the walk. In memory rather than
+     * in storage: a killed worker rebuilds it from Chrome, where the persisted
+     * form would have to be reconciled against visits recorded while it was gone.
+     */
+    __publicField(this, "visitCache", null);
+    __publicField(this, "visitCacheSize", 0);
   }
   moduleName() {
     return "HistoryServiceWorkerModule";
@@ -11306,6 +11324,17 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     };
     return tryReload();
   }
+  /** Runs one walk, holding its visit cache for exactly that long. */
+  async runCollectionCycle(eager) {
+    this.visitCache = /* @__PURE__ */ new Map();
+    this.visitCacheSize = 0;
+    try {
+      await this.walkWindows(eager);
+    } finally {
+      this.visitCache = null;
+      this.visitCacheSize = 0;
+    }
+  }
   /**
    * Walk browsing history forward in fixed time windows.
    *
@@ -11326,7 +11355,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
    * an immediate alarm to continue back-to-back. collection-complete fires
    * only when the cursor actually reaches ~now.
    */
-  async runCollectionCycle(eager) {
+  async walkWindows(eager) {
     const cycleNow = Date.now();
     const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1e3;
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS;
@@ -11510,13 +11539,34 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to emit rex-history-window-overflow diagnostic:", diagnosticError);
     }
   }
+  /**
+   * Every visit of a URL, from the walk's cache when it is already there.
+   *
+   * Caching stops once the walk is holding collection_visit_cache_max_visits,
+   * so a profile with more heavy URLs than fit in a worker falls back to the
+   * per-window fetch rather than growing without bound. Outside a walk the
+   * cache is absent and every call goes to Chrome.
+   */
+  async visitsForUrl(url) {
+    const cached = this.visitCache?.get(url);
+    if (cached !== void 0) {
+      return cached;
+    }
+    const visits = await globalThis.chrome.history.getVisits({ url });
+    const ceiling = this.config?.collection_visit_cache_max_visits ?? DEFAULT_VISIT_CACHE_MAX_VISITS;
+    if (this.visitCache !== null && this.visitCacheSize + visits.length <= ceiling) {
+      this.visitCache.set(url, visits);
+      this.visitCacheSize += visits.length;
+    }
+    return visits;
+  }
   async processHistoryBatch(historyItems, windowStart, windowEnd) {
     let collectedCount = 0;
     for (const item of historyItems) {
       if (!item.url) continue;
       let failedStep = "getVisits";
       try {
-        const visits = await globalThis.chrome.history.getVisits({ url: item.url });
+        const visits = await this.visitsForUrl(item.url);
         for (const visit of visits) {
           if (!visit.visitTime || visit.visitTime < windowStart || visit.visitTime >= windowEnd) continue;
           if (this.shouldSkipUrl(item.url)) {
