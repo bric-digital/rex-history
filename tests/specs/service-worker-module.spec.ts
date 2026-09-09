@@ -2012,6 +2012,114 @@ test.describe('HistoryServiceWorkerModule — Per-walk visit cache', () => {
   })
 })
 
+test.describe('HistoryServiceWorkerModule — Visits-per-URL ceiling', () => {
+  /**
+   * A self-refreshing page can hold hundreds of thousands of visits on one URL
+   * (441,778 in the WebEatsItself pilot). Enumerating them costs seconds per
+   * fetch and hours of upload queue, and carries no information beyond "the page
+   * was open". Above a configured ceiling the walk stops enumerating and emits
+   * one aggregate record per window instead.
+   *
+   * Choosing the value is a research decision, so the ceiling is unset by
+   * default and warn-only mode reports what it would do without doing it.
+   */
+  const HOUR = 60 * 60 * 1000
+  const BUSY = 'https://dashboard.example.com/'
+
+  /** One URL whose visitCount reports far more visits than it really has. */
+  async function seedBusyUrl(page: import('@playwright/test').Page, windowStart: number, visitCount: number) {
+    await page.evaluate(({ url, windowStart, visitCount }) => {
+      ;(window as any).chrome.history._items.push({
+        id: 'busy-item',
+        url,
+        title: 'Dashboard',
+        lastVisitTime: windowStart + 60_000,
+        visitCount,
+        typedCount: 0,
+        _visits: [
+          { visitId: '900', visitTime: windowStart + 60_000, transition: 'link' },
+          { visitId: '901', visitTime: windowStart + 120_000, transition: 'link' }
+        ]
+      })
+    }, { url: BUSY, windowStart, visitCount })
+
+    await page.evaluate(async (windowStart) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = windowStart
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, windowStart)
+  }
+
+  async function collect(page: import('@playwright/test').Page, overrides: Record<string, unknown>) {
+    await setupWalkTest(page, overrides)
+    const windowStart = Date.now() - 2 * HOUR
+    await seedBusyUrl(page, windowStart, 440_000)
+
+    let lookups = 0
+    await page.exposeFunction('__countLookup', () => { lookups++ })
+    await page.evaluate(() => {
+      const history = (window as any).chrome.history
+      const original = history.getVisits.bind(history)
+      history.getVisits = async (details: { url: string }) => {
+        await (window as any).__countLookup()
+        return original(details)
+      }
+    })
+
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    return {
+      visits: events.filter((e) => e.name === 'rex-history-visit' && e.url === BUSY),
+      aggregates: events.filter((e) => e.name === 'rex-history-visit-aggregate'),
+      warnings: events.filter((e) => e.event_name === 'rex-history-visit-ceiling-exceeded'),
+      lookups
+    }
+  }
+
+  test('no ceiling configured collects every visit, as before', async ({ page }) => {
+    const result = await collect(page, {})
+
+    // Premise for both tests below: this URL is collected normally by default,
+    // so an aggregate later is the ceiling acting and not some other refusal.
+    expect(result.visits.length).toBe(2)
+    expect(result.aggregates.length).toBe(0)
+    expect(result.warnings.length).toBe(0)
+  })
+
+  test('above the ceiling, one aggregate replaces the visits and no lookup happens', async ({ page }) => {
+    const result = await collect(page, { max_visits_per_url: 1000 })
+
+    expect(result.visits.length).toBe(0)
+    expect(result.aggregates.length).toBe(1)
+    // The ceiling exists to avoid the fetch, so it has to gate ahead of it.
+    expect(result.lookups).toBe(0)
+
+    const aggregate = result.aggregates[0]!
+    expect(aggregate.url).toBe(BUSY)
+    expect(aggregate.visit_count).toBe(440_000)
+    expect(typeof aggregate.window_start).toBe('number')
+    expect(typeof aggregate.window_end).toBe('number')
+  })
+
+  test('warn-only reports the URL and still collects it in full', async ({ page }) => {
+    const result = await collect(page, { max_visits_per_url: 1000, max_visits_per_url_warn_only: true })
+
+    // The whole point: data is identical to the no-ceiling case.
+    expect(result.visits.length).toBe(2)
+    expect(result.aggregates.length).toBe(0)
+    expect(result.warnings.length).toBeGreaterThan(0)
+
+    const details = result.warnings[0]!.event_details as Record<string, unknown>
+    expect(details.visit_count).toBe(440_000)
+    expect(details.ceiling).toBe(1000)
+  })
+})
+
 test.describe('HistoryServiceWorkerModule — triggerHistoryCollection eagerness', () => {
   /**
    * Eager mode re-arms an immediate continuation alarm so a backfill runs
