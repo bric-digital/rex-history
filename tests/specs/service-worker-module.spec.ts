@@ -2011,3 +2011,67 @@ test.describe('HistoryServiceWorkerModule — Per-walk visit cache', () => {
     expect(emitted.map((e) => e.visit_id)).toContain('999')
   })
 })
+
+test.describe('HistoryServiceWorkerModule — triggerHistoryCollection eagerness', () => {
+  /**
+   * Eager mode re-arms an immediate continuation alarm so a backfill runs
+   * back to back; it exists for offboarding, where the participant is waiting
+   * on a spinner. The host extension's every-minute tick sends the same
+   * message, so a routine tick ran the walk back to back all day instead of
+   * one bounded walk per minute — the participant-visible half of the 0.0.43
+   * stall.
+   *
+   * The message keeps its eager default so every existing caller is unchanged;
+   * a periodic caller asks for the gentle walk explicitly.
+   */
+  const HOUR = 60 * 60 * 1000
+
+  async function parkCursorFarBack(page: import('@playwright/test').Page) {
+    await page.evaluate(async (parked) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = parked
+      await window.chrome.storage.local.set(data)
+      ;(window as any).__capturedEvents = []
+    }, Date.now() - 6 * HOUR)
+  }
+
+  async function eagerAlarmArmed(page: import('@playwright/test').Page) {
+    return page.evaluate(
+      () => 'rex-history-collection-eager' in (window as any).chrome.alarms._alarms
+    )
+  }
+
+  test('the message stays eager by default, re-arming the continuation alarm', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    await parkCursorFarBack(page)
+
+    await page.evaluate(() => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection' }))
+    await waitForCollectionComplete(page)
+
+    // Premise: the budget ran out before catching up, which is the only state
+    // in which eagerness is observable at all.
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-progress').length).toBe(1)
+    expect(await eagerAlarmArmed(page)).toBe(true)
+  })
+
+  test('eager:false yields to the next scheduled wake instead', async ({ page }) => {
+    await setupWalkTest(page, { collection_walk_budget_ms: 0 })
+    await parkCursorFarBack(page)
+
+    await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection', eager: false })
+    )
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () => (window as any).__capturedEvents as Record<string, unknown>[]
+    )
+    // Same premise: the walk yielded partway, so the only difference between
+    // the two tests is what happens next.
+    expect(events.filter((e) => e.event_name === 'rex-history-collection-progress').length).toBe(1)
+    expect(await eagerAlarmArmed(page)).toBe(false)
+  })
+})

@@ -11963,8 +11963,9 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
   handleMessage(message, sender, sendResponse) {
     console.log("[rex-history] Received message:", message.messageType);
     if (message.messageType === "triggerHistoryCollection") {
-      console.log("[rex-history] Triggering manual collection (eager)");
-      this.collectHistory(true).then(() => {
+      const eager = message.eager !== false;
+      console.log(`[rex-history] Triggering manual collection (eager=${eager})`);
+      this.collectHistory(eager).then(() => {
         sendResponse({ success: true });
       }).catch((error) => {
         sendResponse({ success: false, error: error.message });

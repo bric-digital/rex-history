@@ -1533,8 +1533,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (message.messageType === 'triggerHistoryCollection') {
       // Manual/offboarding trigger → eager backfill: walk to completion across
       // back-to-back wakes so the offboarding spinner releases ASAP.
-      console.log('[rex-history] Triggering manual collection (eager)')
-      this.collectHistory(true).then(() => {
+      //
+      // A caller on its own schedule passes eager: false to get one bounded
+      // walk per call instead. Eager remains the default so that callers
+      // predating this flag keep the behavior they were written against.
+      const eager = message.eager !== false
+      console.log(`[rex-history] Triggering manual collection (eager=${eager})`)
+      this.collectHistory(eager).then(() => {
         sendResponse({ success: true })
       }).catch((error) => {
         sendResponse({ success: false, error: error.message })
