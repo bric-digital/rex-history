@@ -11560,77 +11560,167 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     }
     return visits;
   }
+  /**
+   * How a URL may be recorded, before any visit is attached.
+   *
+   * Every branch here depends on the URL alone, so an aggregate record for a URL
+   * whose visits are never enumerated resolves exactly as an individual visit
+   * would. Two emitters, one privacy precedence: domain-only wins outright, then
+   * a configured allow-list that does not match redacts, then a filter-list
+   * match redacts to its category.
+   */
+  async resolveRecordedUrl(item, context) {
+    const url = item.url ?? "";
+    let registeredDomain = "not available";
+    try {
+      const urlObj = new URL(url);
+      const hostname = urlObj.hostname;
+      const parsed = na.parse(hostname);
+      if (parsed.error === void 0 && "domain" in parsed && parsed.domain) {
+        registeredDomain = parsed.domain;
+      }
+    } catch {
+    }
+    let recordedUrl;
+    let recordedTitle = item.title || "";
+    let filteredByList;
+    let filterMatch;
+    const domainOnlyResult = await this.applyDomainOnlyLists(url, context);
+    let allowCheck;
+    if (domainOnlyResult.filteredByList) {
+      recordedUrl = "DOMAIN ONLY";
+      recordedTitle = "DOMAIN ONLY";
+      filteredByList = domainOnlyResult.filteredByList;
+      filterMatch = domainOnlyResult.filterMatch;
+      allowCheck = { allowed: true };
+    } else {
+      allowCheck = await this.checkAllowLists(url);
+      if (!allowCheck.allowed) {
+        recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
+        recordedTitle = "";
+        registeredDomain = "";
+        await this.maybeLogFilteredUrlDebug(url, recordedUrl, "NOT_ON_ALLOWLIST", void 0, context);
+      } else {
+        const filterResult = await this.applyFilterLists(url, context);
+        recordedUrl = filterResult.recordedUrl;
+        filteredByList = filterResult.filteredByList;
+        filterMatch = filterResult.filterMatch;
+        if (recordedUrl.startsWith("CATEGORY:")) {
+          recordedTitle = "";
+          registeredDomain = "";
+        }
+      }
+    }
+    return { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck };
+  }
+  /**
+   * True when a URL has more visits than a study is willing to enumerate.
+   *
+   * `visitCount` rides along on the search() result, so this costs nothing and,
+   * unlike the visit list itself, is known before the expensive call.
+   */
+  exceedsVisitCeiling(item) {
+    const ceiling = this.config?.max_visits_per_url;
+    if (ceiling === void 0 || ceiling <= 0) {
+      return false;
+    }
+    return (item.visitCount ?? 0) > ceiling;
+  }
+  /**
+   * Names a URL that a ceiling would have aggregated, while it is still being
+   * collected in full.
+   *
+   * The address goes through the same redaction the record would, so turning
+   * warning on cannot disclose a URL that collection itself would have masked.
+   */
+  async emitCeilingDiagnostic(item, windowStart, windowEnd) {
+    try {
+      const resolved = await this.resolveRecordedUrl(item, { history_item_id: item.id });
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-visit-ceiling-exceeded",
+        event_details: {
+          recorded_url: resolved.recordedUrl,
+          domain: resolved.registeredDomain,
+          visit_count: item.visitCount,
+          ceiling: this.config?.max_visits_per_url,
+          window_start: windowStart,
+          window_end: windowEnd,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-visit-ceiling-exceeded diagnostic:", diagnosticError);
+    }
+  }
+  /**
+   * One record standing in for every visit this URL has in this window.
+   *
+   * Emitted per window rather than per walk so the time profile survives: a URL
+   * that is open all morning still says so, window by window. The per-window
+   * visit count is deliberately absent, because counting them means the
+   * enumeration this exists to avoid. `visit_count` is the profile-wide count,
+   * the same field and meaning it carries on an ordinary record.
+   */
+  async emitAggregateRecord(item, windowStart, windowEnd) {
+    const resolved = await this.resolveRecordedUrl(item, { history_item_id: item.id });
+    const categories = await this.categorizeUrl(item.url ?? "");
+    console.log(`[rex-history] Logging event: rex-history-visit-aggregate (${item.visitCount} visits)`);
+    dispatchEvent({
+      name: "rex-history-visit-aggregate",
+      url: resolved.recordedUrl,
+      recorded_url: resolved.recordedUrl,
+      domain: resolved.registeredDomain,
+      title: resolved.recordedTitle,
+      categories,
+      date: windowStart,
+      // The window this record stands for. Individual visit times are not
+      // available without the enumeration that was skipped.
+      window_start: windowStart,
+      window_end: windowEnd,
+      history_item_id: item.id,
+      last_visit_time: item.lastVisitTime,
+      visit_count: item.visitCount,
+      typed_count: item.typedCount,
+      allowed_by_list: resolved.allowCheck.matchedList,
+      filtered: Boolean(resolved.filteredByList),
+      filtered_by_list: resolved.filteredByList
+    });
+  }
   async processHistoryBatch(historyItems, windowStart, windowEnd) {
     let collectedCount = 0;
     for (const item of historyItems) {
       if (!item.url) continue;
       let failedStep = "getVisits";
       try {
+        if (this.exceedsVisitCeiling(item)) {
+          if (this.config?.max_visits_per_url_warn_only === true) {
+            failedStep = "ceiling-diagnostic";
+            if (!this.shouldSkipUrl(item.url)) {
+              await this.emitCeilingDiagnostic(item, windowStart, windowEnd);
+            }
+          } else {
+            failedStep = "aggregate";
+            if (!this.shouldSkipUrl(item.url)) {
+              await this.emitAggregateRecord(item, windowStart, windowEnd);
+              collectedCount++;
+            }
+            continue;
+          }
+        }
         const visits = await this.visitsForUrl(item.url);
         for (const visit of visits) {
           if (!visit.visitTime || visit.visitTime < windowStart || visit.visitTime >= windowEnd) continue;
           if (this.shouldSkipUrl(item.url)) {
             continue;
           }
-          let registeredDomain = "not available";
-          try {
-            const urlObj = new URL(item.url);
-            const hostname = urlObj.hostname;
-            const parsed = na.parse(hostname);
-            if (parsed.error === void 0 && "domain" in parsed && parsed.domain) {
-              registeredDomain = parsed.domain;
-            }
-          } catch {
-          }
-          let recordedUrl = item.url;
-          let recordedTitle = item.title || "";
-          let filteredByList;
-          let filterMatch;
           failedStep = "list-matching";
-          const domainOnlyResult = await this.applyDomainOnlyLists(item.url, {
+          const resolved = await this.resolveRecordedUrl(item, {
             visit_id: visit.visitId,
             visit_time: visit.visitTime,
             history_item_id: item.id
           });
-          let allowCheck;
-          if (domainOnlyResult.filteredByList) {
-            recordedUrl = "DOMAIN ONLY";
-            recordedTitle = "DOMAIN ONLY";
-            filteredByList = domainOnlyResult.filteredByList;
-            filterMatch = domainOnlyResult.filterMatch;
-            allowCheck = { allowed: true };
-          } else {
-            allowCheck = await this.checkAllowLists(item.url);
-            if (!allowCheck.allowed) {
-              recordedUrl = "CATEGORY:NOT_ON_ALLOWLIST";
-              recordedTitle = "";
-              registeredDomain = "";
-              await this.maybeLogFilteredUrlDebug(
-                item.url,
-                recordedUrl,
-                "NOT_ON_ALLOWLIST",
-                void 0,
-                {
-                  visit_id: visit.visitId,
-                  visit_time: visit.visitTime,
-                  history_item_id: item.id
-                }
-              );
-            } else {
-              const filterResult = await this.applyFilterLists(item.url, {
-                visit_id: visit.visitId,
-                visit_time: visit.visitTime,
-                history_item_id: item.id
-              });
-              recordedUrl = filterResult.recordedUrl;
-              filteredByList = filterResult.filteredByList;
-              filterMatch = filterResult.filterMatch;
-              if (recordedUrl.startsWith("CATEGORY:")) {
-                recordedTitle = "";
-                registeredDomain = "";
-              }
-            }
-          }
+          const { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck } = resolved;
           failedStep = "categorize";
           const categories = await this.categorizeUrl(item.url);
           const matchUrl = recordedUrl.startsWith("CATEGORY:") || recordedUrl === "" ? recordedUrl : item.url;
