@@ -10892,6 +10892,8 @@ var DEFAULT_LOOKBACK_DAYS = 90;
 var DEFAULT_COLLECTION_WINDOW_HOURS = 1;
 var DEFAULT_WALK_BUDGET_MS = 2e4;
 var MIN_WINDOW_MS = 6e4;
+var DEFAULT_MAX_WINDOW_ATTEMPTS = 5;
+var WALK_ATTEMPT_KEY = "webmunkHistoryWalkAttempt";
 var OVERFLOW_MARKER_KEY = "webmunkHistoryOverflowMarker";
 function getUrlActiveSeam() {
   return globalThis.__rexPageEventsUrlActive;
@@ -11229,6 +11231,27 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       console.error("[rex-history] Failed to emit rex-history-cursor-write-failed diagnostic:", diagnosticError);
     }
   }
+  emitCollectionErrorDiagnostic(error) {
+    try {
+      let errorName = "unknown";
+      let errorMessage = String(error);
+      if (error instanceof Error) {
+        errorName = error.name;
+        errorMessage = error.message;
+      }
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-collection-error",
+        event_details: {
+          error_name: errorName,
+          error_message: errorMessage,
+          date: Date.now()
+        }
+      });
+    } catch (diagnosticError) {
+      console.error("[rex-history] Failed to emit rex-history-collection-error diagnostic:", diagnosticError);
+    }
+  }
   collectHistory(eager = false) {
     if (this.status.isCollecting) {
       console.log("[rex-history] Collection already in progress, skipping");
@@ -11257,7 +11280,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         return;
       }
       console.error("[rex-history] Collection error:", error);
-      return this.setLastFetchTime(Date.now());
+      this.emitCollectionErrorDiagnostic(error);
     }).finally(() => {
       this.status.isCollecting = false;
       return this.saveStatus().finally(() => {
@@ -11295,10 +11318,13 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
    * older visits and never finished on heavy histories.
    *
    * Per-wake the walk is bounded by a wall-clock budget (MV3 worker-lifetime
-   * guard). When the budget is hit before catching up to now, it emits a
-   * progress event and yields: a periodic alarm resumes next cycle; an eager
-   * (offboarding) walk re-arms an immediate alarm to continue back-to-back.
-   * collection-complete fires only when the cursor actually reaches ~now.
+   * guard), enforced between windows and, inside a split window, between
+   * sub-windows. Each fully-closed sub-window persists the cursor, so a
+   * worker killed mid-window resumes at most one leaf back. When the budget
+   * is hit before catching up to now, it emits a progress event and yields:
+   * a periodic alarm resumes next cycle; an eager (offboarding) walk re-arms
+   * an immediate alarm to continue back-to-back. collection-complete fires
+   * only when the cursor actually reaches ~now.
    */
   async runCollectionCycle(eager) {
     const cycleNow = Date.now();
@@ -11306,6 +11332,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS;
     const deadline = cycleNow + budgetMs;
     let cursor = await this.getLastFetchTime();
+    cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs);
     console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`);
     let collectedCount = 0;
     let windowsThisWake = 0;
@@ -11314,8 +11341,9 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
         break;
       }
       const windowEnd = Math.min(cursor + windowMs, cycleNow);
-      collectedCount += await this.collectWindow(cursor, windowEnd);
-      cursor = windowEnd;
+      const result = await this.collectWindow(cursor, windowEnd, deadline);
+      collectedCount += result.collectedCount;
+      cursor = result.advancedTo;
       await this.setLastFetchTime(cursor);
       windowsThisWake++;
     }
@@ -11347,13 +11375,59 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
     }
   }
   /**
+   * Wedge breaker: a wake that starts at the same cursor as the previous wake
+   * means that wake persisted no progress (killed before closing one leaf).
+   * Count consecutive same-cursor starts durably; past the limit, skip one
+   * window and emit a server-visible diagnostic. Losing at most one window
+   * beats the field failure mode of losing everything from the wedge onward.
+   */
+  async advancePastStuckWindow(cursor, cycleNow, windowMs) {
+    try {
+      const stored = await globalThis.chrome.storage.local.get(WALK_ATTEMPT_KEY);
+      const attempt = stored[WALK_ATTEMPT_KEY];
+      const maxAttempts = this.config?.collection_max_window_attempts ?? DEFAULT_MAX_WINDOW_ATTEMPTS;
+      const now = Date.now();
+      if (attempt === void 0 || attempt.cursor !== cursor) {
+        await globalThis.chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor, attempts: 1, firstAttemptAt: now } });
+        return cursor;
+      }
+      if (attempt.attempts < maxAttempts) {
+        await globalThis.chrome.storage.local.set({
+          [WALK_ATTEMPT_KEY]: { cursor, attempts: attempt.attempts + 1, firstAttemptAt: attempt.firstAttemptAt }
+        });
+        return cursor;
+      }
+      const skippedTo = Math.min(cursor + windowMs, cycleNow);
+      console.error(`[rex-history] Walk stuck at ${new Date(cursor).toISOString()} after ${attempt.attempts} attempts \u2014 skipping to ${new Date(skippedTo).toISOString()}`);
+      dispatchEvent({
+        name: "pdk-app-event",
+        event_name: "rex-history-walk-stuck",
+        event_details: {
+          cursor,
+          attempts: attempt.attempts,
+          first_attempt_at: attempt.firstAttemptAt,
+          skipped_to: skippedTo,
+          date: now
+        }
+      });
+      await this.setLastFetchTime(skippedTo);
+      await globalThis.chrome.storage.local.set({ [WALK_ATTEMPT_KEY]: { cursor: skippedTo, attempts: 1, firstAttemptAt: now } });
+      return skippedTo;
+    } catch (error) {
+      console.error("[rex-history] Stuck-window bookkeeping failed:", error);
+      return cursor;
+    }
+  }
+  /**
    * Collect every visit inside [windowStart, windowEnd). If the window returns a
    * full page it holds more URLs than one page can safely carry: split it toward
    * MIN_WINDOW_MS. A sub-MIN_WINDOW_MS window that still overflows is collected
    * best-effort and a privacy-safe overflow diagnostic is emitted — the walk
-   * never wedges on one abnormally heavy stretch. Returns visits collected.
+   * never wedges on one abnormally heavy stretch. Returns visits collected and
+   * how far the window is durably closed (`advancedTo`); `advancedTo <
+   * windowEnd` means the deadline was hit between sub-windows.
    */
-  async collectWindow(windowStart, windowEnd) {
+  async collectWindow(windowStart, windowEnd, deadline) {
     const pageSize = this.config?.collection_page_size ?? DEFAULT_COLLECTION_PAGE_SIZE;
     const historyItems = await globalThis.chrome.history.search({
       text: "",
@@ -11365,9 +11439,19 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       const span = windowEnd - windowStart;
       if (span > MIN_WINDOW_MS) {
         const mid = windowStart + Math.floor(span / 2);
-        const first = await this.collectWindow(windowStart, mid);
-        const second = await this.collectWindow(mid, windowEnd);
-        return first + second;
+        const first = await this.collectWindow(windowStart, mid, deadline);
+        if (first.advancedTo < mid) {
+          return first;
+        }
+        await this.setLastFetchTime(mid);
+        if (Date.now() >= deadline) {
+          return { collectedCount: first.collectedCount, advancedTo: mid };
+        }
+        const second = await this.collectWindow(mid, windowEnd, deadline);
+        return {
+          collectedCount: first.collectedCount + second.collectedCount,
+          advancedTo: second.advancedTo
+        };
       }
       this.emitWindowOverflowDiagnostic(windowStart, windowEnd, historyItems.length, pageSize);
       await globalThis.chrome.storage.local.set({
@@ -11382,10 +11466,10 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       });
       const overflowResult = await this.processHistoryBatch(allItems, windowStart, windowEnd);
       await globalThis.chrome.storage.local.remove(OVERFLOW_MARKER_KEY);
-      return overflowResult.collectedCount;
+      return { collectedCount: overflowResult.collectedCount, advancedTo: windowEnd };
     }
     const batchResult = await this.processHistoryBatch(historyItems, windowStart, windowEnd);
-    return batchResult.collectedCount;
+    return { collectedCount: batchResult.collectedCount, advancedTo: windowEnd };
   }
   /**
    * Dispatch rex-history-collection-complete. Delays 1.1s when items were
@@ -11848,6 +11932,7 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
       const lookbackMs = lookbackDays * 24 * 60 * 60 * 1e3;
       globalThis.chrome.history.search({ text: "", startTime: 0, maxResults: 1e4 }).then((items) => {
         if (items.length === 0) {
+          console.log("[rex-history] getOldestHistoryAge: no history items found, ageSeconds=null");
           sendResponse({ ageSeconds: null });
           return;
         }
@@ -11862,12 +11947,23 @@ var _HistoryServiceWorkerModule = class _HistoryServiceWorkerModule extends REXS
               (min, item) => Math.min(min, item.lastVisitTime ?? oldestVisitTime),
               oldestVisitTime
             );
-            sendResponse({ ageSeconds: (Date.now() - oldest) / 1e3 });
-          }).catch(() => sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 }));
+            const ageSeconds = (Date.now() - oldest) / 1e3;
+            console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldest).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`);
+            sendResponse({ ageSeconds });
+          }).catch((error) => {
+            const ageSeconds = (Date.now() - oldestVisitTime) / 1e3;
+            console.warn("[rex-history] getOldestHistoryAge: second-page search failed, falling back to first-page oldest:", error);
+            sendResponse({ ageSeconds });
+          });
         } else {
-          sendResponse({ ageSeconds: (Date.now() - oldestVisitTime) / 1e3 });
+          const ageSeconds = (Date.now() - oldestVisitTime) / 1e3;
+          console.log(`[rex-history] getOldestHistoryAge: oldest visit ${new Date(oldestVisitTime).toISOString()}, ageSeconds=${ageSeconds} (${(ageSeconds / 86400).toFixed(1)} days)`);
+          sendResponse({ ageSeconds });
         }
-      }).catch(() => sendResponse({ ageSeconds: null }));
+      }).catch((error) => {
+        console.warn("[rex-history] getOldestHistoryAge: history search failed, ageSeconds=null:", error);
+        sendResponse({ ageSeconds: null });
+      });
       return true;
     }
     console.log("[rex-history] Unknown message type, not handling");

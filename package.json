@@ -41,5 +41,8 @@
         "@bric/rex-types": "github:bric-digital/rex-types",
         "@types/node": "^25.6.0",
         "psl": "^1.9.0"
+    },
+    "allowScripts": {
+        "esbuild@0.28.1": true
     }
 }
