@@ -50,6 +50,12 @@ interface HistoryConfig {
    * rex-history-walk-stuck diagnostic. Default 5 when unset.
    */
   collection_max_window_attempts?: number;
+  /**
+   * Ceiling on how many visits one walk may hold in its per-URL visit cache.
+   * Past it, further URLs are fetched per window as before, trading the walk's
+   * speed for a bound on worker memory. Default 500000 when unset.
+   */
+  collection_visit_cache_max_visits?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +80,7 @@ const DEFAULT_WALK_BUDGET_MS = 20000
 const MIN_WINDOW_MS = 60000
 const DEFAULT_MAX_WINDOW_ATTEMPTS = 5
 const WALK_ATTEMPT_KEY = 'webmunkHistoryWalkAttempt'
+const DEFAULT_VISIT_CACHE_MAX_VISITS = 500000
 
 interface WindowWalkResult {
   collectedCount: number;
@@ -143,6 +150,24 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * By coalescing overlapping calls into a single promise we avoid the race.
    */
   private loadConfigurationPromise: Promise<void> | null = null
+
+  /**
+   * A walk's visit lists, keyed by URL.
+   *
+   * chrome.history.getVisits takes no time range, so it returns every visit a
+   * URL has ever had no matter which window asked. The windowed walk sees the
+   * same URL once per window it has a visit in, and a URL that is revisited
+   * continuously appears in all of them: a self-refreshing dashboard cost one
+   * full fetch of 441,778 visits per window, at 1.3-1.5s each, which consumed
+   * the whole wall-clock budget before any window closed.
+   *
+   * The list a window needs is the same list every other window in the walk
+   * needs, so it is fetched once and held for the walk. In memory rather than
+   * in storage: a killed worker rebuilds it from Chrome, where the persisted
+   * form would have to be reconciled against visits recorded while it was gone.
+   */
+  private visitCache: Map<string, chrome.history.VisitItem[]> | null = null
+  private visitCacheSize = 0
 
   /**
    * DEV-ONLY debug flag:
@@ -650,6 +675,21 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     return tryReload()
   }
 
+  /** Runs one walk, holding its visit cache for exactly that long. */
+  private async runCollectionCycle(eager: boolean): Promise<void> {
+    this.visitCache = new Map()
+    this.visitCacheSize = 0
+
+    try {
+      await this.walkWindows(eager)
+    } finally {
+      // Held only for the walk. Chrome keeps recording visits after it, so a
+      // list carried into the next wake would be missing everything since.
+      this.visitCache = null
+      this.visitCacheSize = 0
+    }
+  }
+
   /**
    * Walk browsing history forward in fixed time windows.
    *
@@ -670,7 +710,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * an immediate alarm to continue back-to-back. collection-complete fires
    * only when the cursor actually reaches ~now.
    */
-  private async runCollectionCycle(eager: boolean): Promise<void> {
+  private async walkWindows(eager: boolean): Promise<void> {
     const cycleNow = Date.now()
     const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1000
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS
@@ -907,6 +947,32 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
+  /**
+   * Every visit of a URL, from the walk's cache when it is already there.
+   *
+   * Caching stops once the walk is holding collection_visit_cache_max_visits,
+   * so a profile with more heavy URLs than fit in a worker falls back to the
+   * per-window fetch rather than growing without bound. Outside a walk the
+   * cache is absent and every call goes to Chrome.
+   */
+  private async visitsForUrl(url: string): Promise<chrome.history.VisitItem[]> {
+    const cached = this.visitCache?.get(url)
+
+    if (cached !== undefined) {
+      return cached
+    }
+
+    const visits = await chrome.history.getVisits({ url })
+    const ceiling = this.config?.collection_visit_cache_max_visits ?? DEFAULT_VISIT_CACHE_MAX_VISITS
+
+    if (this.visitCache !== null && this.visitCacheSize + visits.length <= ceiling) {
+      this.visitCache.set(url, visits)
+      this.visitCacheSize += visits.length
+    }
+
+    return visits
+  }
+
   private async processHistoryBatch(
     historyItems: chrome.history.HistoryItem[],
     windowStart: number,
@@ -927,7 +993,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       let failedStep = 'getVisits'
       try {
       // Get visits for this item
-      const visits = await chrome.history.getVisits({ url: item.url })
+      const visits = await this.visitsForUrl(item.url)
 
       for (const visit of visits) {
         // Process only visits inside this window [windowStart, windowEnd).
@@ -1467,8 +1533,13 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (message.messageType === 'triggerHistoryCollection') {
       // Manual/offboarding trigger → eager backfill: walk to completion across
       // back-to-back wakes so the offboarding spinner releases ASAP.
-      console.log('[rex-history] Triggering manual collection (eager)')
-      this.collectHistory(true).then(() => {
+      //
+      // A caller on its own schedule passes eager: false to get one bounded
+      // walk per call instead. Eager remains the default so that callers
+      // predating this flag keep the behavior they were written against.
+      const eager = message.eager !== false
+      console.log(`[rex-history] Triggering manual collection (eager=${eager})`)
+      this.collectHistory(eager).then(() => {
         sendResponse({ success: true })
       }).catch((error) => {
         sendResponse({ success: false, error: error.message })
