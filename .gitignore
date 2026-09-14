@@ -145,3 +145,6 @@ playwright/.cache/
 tests/src/build/
 tests/extension/service-worker.bundle.js
 docs/superpowers/
+
+*.bundle.js
+*.bundle.js.map
