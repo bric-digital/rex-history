@@ -80,6 +80,9 @@ interface HistoryConfig {
    * ceiling that silently did nothing would be the more surprising default.
    */
   max_visits_per_url_warn_only?: boolean;
+
+  // Flag to enable recording all URLs, including chrome:// URLs. Off by default.
+  record_all_urls?:boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +204,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * This is explicitly blocked outside the dev extension to prevent accidental deployment.
    */
   private static readonly DEBUG_LOG_FILTERED_URLS_KEY = 'webmunk_debug_log_filtered_urls'
+
+  private recordAllUrls:boolean = false
 
   constructor() {
     super()
@@ -405,6 +410,23 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         console.warn('[rex-history] No history configuration found in rex-core configuration')
       }
 
+      const recordAllUrls = this.config?.record_all_urls
+
+      if (recordAllUrls === true) {
+        this.recordAllUrls = true
+      } else {
+        this.recordAllUrls = false
+      }
+      
+      if (!allowLists || allowLists.length === 0) {
+        this.status.listsReady = true
+      } else {
+        const checks = await Promise.all(allowLists.map((name) => listUtils.hasListEntries(name)))
+        if (checks.some(Boolean)) {
+          this.status.listsReady = true
+        }
+      }
+
       if (!syncLists) return
 
       const listConfig = configurationRecord?.['lists']
@@ -422,6 +444,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           this.status.listsReady = true
         }
       }
+
       await this.saveStatus()
 
     } catch (error) {
@@ -1411,6 +1434,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * (Filter lists are handled separately and do NOT skip; they replace recorded URL.)
    */
   private shouldSkipUrl(url: string): boolean {
+    if (this.recordAllUrls) {
+      return true
+    }
+    
     // Only allow http(s) by default (privacy).
     return !(url.startsWith('http://') || url.startsWith('https://'))
   }
