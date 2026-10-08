@@ -1438,7 +1438,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     console.log(`[rex-history] shouldSkipUrl: ${this.recordAllUrls}`)
 
     if (this.recordAllUrls) {
-      return true
+      return false
     }
 
     // Only allow http(s) by default (privacy).
