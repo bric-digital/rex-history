@@ -417,7 +417,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       } else {
         this.recordAllUrls = false
       }
-      
+
+      const allowLists = this.config?.allow_lists
+
       if (!allowLists || allowLists.length === 0) {
         this.status.listsReady = true
       } else {
@@ -435,7 +437,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         console.log('[rex-history] Lists synced.')
       }
 
-      const allowLists = this.config?.allow_lists
       if (!allowLists || allowLists.length === 0) {
         this.status.listsReady = true
       } else {
@@ -1435,7 +1436,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    */
   private shouldSkipUrl(url: string): boolean {
     console.log(`[rex-history] shouldSkipUrl: ${this.recordAllUrls}`)
-    
+
     if (this.recordAllUrls) {
       return true
     }
