@@ -1435,8 +1435,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * (Filter lists are handled separately and do NOT skip; they replace recorded URL.)
    */
   private shouldSkipUrl(url: string): boolean {
-    console.log(`[rex-history] shouldSkipUrl: ${this.recordAllUrls}`)
-
     if (this.recordAllUrls) {
       return false
     }
