@@ -1308,14 +1308,15 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
 
   test('first-run seed is lookback_days BEFORE install time', async ({ page }) => {
     // Install was 2 days ago; lookback is 5 days → seed = 7 days before now.
-    // A visit 10 days ago (before the seed) must NOT be collected; a visit
-    // 4 days ago (after the seed, i.e. within the lookback window leading up to
-    // install) MUST be collected even though it predates install.
+    // A visit 10 days ago (before the seed) must NOT be collected; visits
+    // 4 and 6 days ago (after the seed, i.e. within the lookback window leading
+    // up to install) MUST be collected even though they predate install. The
+    // 6-day visit is collected only when the seed is anchored at install time.
     const now = Date.now()
     await page.goto('/test-page.html')
     await waitForModuleSetup(page)
     await page.evaluate((installTime) => {
-      ;(window as any).__mockInstallTime = installTime
+      ;(window as any).chrome.storage.local._data.rexInstallTime = installTime
     }, now - 2 * DAY)
     await seedConfigAndIdentifier(page, { lookback_days: 5, collection_window_hours: 24 })
     await page.evaluate(async () => {
@@ -1329,6 +1330,7 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     // Seed = install(−2d) − lookback(5d) = −7d from now.
     await addHistoryItem(page, 'https://beforeseed.example.com/', 'BeforeSeed', now - 10 * DAY)
     await addHistoryItem(page, 'https://withinwindow.example.com/', 'WithinWindow', now - 4 * DAY)
+    await addHistoryItem(page, 'https://beforeinstall.example.com/', 'BeforeInstall', now - 6 * DAY)
 
     await page.evaluate(() => { (window as any).__capturedEvents = [] })
     await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
@@ -1336,6 +1338,7 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
 
     const urls = await visitUrls(page)
     expect(urls).toContain('https://withinwindow.example.com/')
+    expect(urls).toContain('https://beforeinstall.example.com/')
     expect(urls).not.toContain('https://beforeseed.example.com/')
   })
 
@@ -1343,7 +1346,6 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     const now = Date.now()
     await page.goto('/test-page.html')
     await waitForModuleSetup(page)
-    await page.evaluate(() => { (window as any).__mockInstallTime = null })
     await seedConfigAndIdentifier(page, { lookback_days: 7, collection_window_hours: 24 })
     await page.evaluate(async () => {
       await window.chrome.storage.local.set((window as any).chrome.storage.local._data)

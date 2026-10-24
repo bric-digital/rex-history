@@ -544,14 +544,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * (rex-core owns this — do not read the rexInstallTime storage key directly).
    * Returns null when rex-core hasn't recorded it yet or is too old to answer.
    */
-  private async getInstallTime(): Promise<number | null> {
-    try {
-      const response = await chrome.runtime.sendMessage({ messageType: 'getInstallTime' })
-      return typeof response === 'number' ? response : null
-    } catch (error) {
-      console.error('[rex-history] Failed to get install time from rex-core:', error)
-      return null
-    }
+  private getInstallTime(): Promise<number | null> {
+    return new Promise((resolve) => {
+      rexCorePlugin.handleMessage({ messageType: 'getInstallTime' }, null, (response) => {
+        resolve(typeof response === 'number' ? response : null)
+      })
+    })
   }
 
   async getLastFetchTime(): Promise<number> {
