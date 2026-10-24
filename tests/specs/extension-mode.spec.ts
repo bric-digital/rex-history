@@ -522,6 +522,30 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
     expect(events.some((e) => isHistoryVisit(e) && hasMarker(e, marker2))).toBe(true)
   })
 
+  test('first-run cursor is lookback_days before the install time rex-core holds', async () => {
+    const DAY = 24 * 60 * 60 * 1000
+    const installTime = Date.now() - 2 * DAY
+
+    await injectConfigAndIdentifier(serviceWorker, { lookback_days: 5 })
+    await prepareManualHistoryCollection(serviceWorker)
+
+    const seed = await serviceWorker.evaluate(async (installTime) => {
+      const original = await chrome.storage.local.get('rexInstallTime')
+      await chrome.storage.local.set({ rexInstallTime: installTime })
+      try {
+        return await (self as any).__historyPlugin.getLastFetchTime() // eslint-disable-line @typescript-eslint/no-explicit-any
+      } finally {
+        if (original.rexInstallTime === undefined) {
+          await chrome.storage.local.remove('rexInstallTime')
+        } else {
+          await chrome.storage.local.set({ rexInstallTime: original.rexInstallTime })
+        }
+      }
+    }, installTime)
+
+    expect(seed).toBe(installTime - 5 * DAY)
+  })
+
   // -------------------------------------------------------------------------
   // getOldestHistoryAge
   // -------------------------------------------------------------------------

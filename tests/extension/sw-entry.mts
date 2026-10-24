@@ -9,7 +9,7 @@
  * within the service worker evaluation context.
  */
 import rexCorePlugin, { registerREXModule, REXServiceWorkerModule } from '@bric/rex-core/service-worker'
-import '../../src/service-worker.mjs'  // side-effect: registerREXModule(plugin) + setup()
+import historyPlugin from '../../src/service-worker.mjs'  // side-effect: registerREXModule(plugin) + setup()
 
 // Enable message routing (the minimum subset of rexCorePlugin.setup() needed for tests).
 // This lets chrome.runtime.sendMessage calls from extension pages reach the history module.
@@ -36,6 +36,7 @@ class EventCaptureModule extends REXServiceWorkerModule {
 }
 
 g.__capturedEvents = []
+g.__historyPlugin = historyPlugin
 registerREXModule(new EventCaptureModule())
 
 /**

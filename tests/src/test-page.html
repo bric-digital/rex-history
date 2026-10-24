@@ -45,13 +45,6 @@
             runtime: {
                 getManifest: () => ({ name: 'Webmunk Dev Extension' }),
                 sendMessage: async (message) => {
-                    // rex-core getInstallTime message: tests set
-                    // window.__mockInstallTime to control the value (null = not
-                    // recorded / older rex-core). Default null so first-run seed
-                    // falls back to lookback_days unless a test opts in.
-                    if (message && message.messageType === 'getInstallTime') {
-                        return window.__mockInstallTime ?? null;
-                    }
                     // Mock message handling
                     return { success: true };
                 },
