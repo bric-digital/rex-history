@@ -85,16 +85,6 @@ interface HistoryConfig {
   record_all_urls?:boolean
 }
 
-// ---------------------------------------------------------------------------
-// Optional linkage to rex-page-events.
-//
-// rex-history does NOT import @bric/rex-page-events. The only seam is the
-// well-known `globalThis.__rexPageEventsUrlActive.subscribe` contract installed
-// by rex-page-events at its own setup. If the seam isn't present (because
-// rex-page-events wasn't bundled into this extension), we silently proceed
-// without linkage fields — no error, no crash.
-// ---------------------------------------------------------------------------
-
 const URL_ACTIVE_BUFFER_MAX = 256
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
 const DEFAULT_COLLECTION_PAGE_SIZE = 1000
@@ -129,15 +119,6 @@ interface WindowWalkResult {
 // instead of re-crashing on it forever.
 const OVERFLOW_MARKER_KEY = 'webmunkHistoryOverflowMarker'
 
-interface UrlActiveSeam {
-  subscribe(listener: (event: RexPageUrlActiveEvent) => void): () => void
-}
-
-function getUrlActiveSeam(): UrlActiveSeam | undefined {
-  return (globalThis as unknown as { __rexPageEventsUrlActive?: UrlActiveSeam })
-    .__rexPageEventsUrlActive
-}
-
 interface HistoryStatus {
   lastCollectionTime?: number;
   itemsCollected: number;
@@ -158,12 +139,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * Ring buffer of observed `rex-page-url-active` records from rex-page-events.
-   * Populated only when the optional seam is available. See the module header
-   * for the coupling model.
+   * Ring buffer of observed `rex-page-url-active` records from rex-page-events,
+   * filled from `pageUrlActive` messages.
    */
   private urlActiveBuffer: RexPageUrlActiveEvent[] = []
-  private urlActiveUnsubscribe: (() => void) | null = null
 
   /**
    * Guards against concurrent loadConfiguration() calls.
@@ -219,25 +198,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   // Optional rex-page-events linkage
   // -------------------------------------------------------------------------
 
-  /**
-   * Probe for the rex-page-events subscriber seam and subscribe if present.
-   * Safe to call once per setup; idempotent if called twice in a row.
-   */
-  private trySubscribeUrlActive(): void {
-    if (this.urlActiveUnsubscribe !== null) {
-      return // already subscribed
-    }
-    const seam = getUrlActiveSeam()
-    if (seam === undefined || typeof seam.subscribe !== 'function') {
-      console.log('[rex-history] rex-page-events not detected; visits will not carry tab linkage fields')
-      return
-    }
-    this.urlActiveUnsubscribe = seam.subscribe((record) => {
-      this.recordUrlActive(record)
-    })
-    console.log('[rex-history] Subscribed to rex-page-events url-active seam')
-  }
-
   private recordUrlActive(record: RexPageUrlActiveEvent): void {
     this.urlActiveBuffer.push(record)
     if (this.urlActiveBuffer.length > URL_ACTIVE_BUFFER_MAX) {
@@ -288,10 +248,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
   async setup() {
     console.log('[rex-history/service-worker] Setting up history collection module')
-
-    // Optional linkage to rex-page-events. If the seam is absent (module not
-    // bundled), the buffer stays empty and visits go out without linkage fields.
-    this.trySubscribeUrlActive()
 
     // Initialize list database
     try {
@@ -1705,6 +1661,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   handleMessage(message: { messageType: string; [key: string]: unknown }, sender: chrome.runtime.MessageSender, sendResponse: (response: unknown) => void): boolean {
+    if (message.messageType === 'pageUrlActive') {
+      this.recordUrlActive(message.event as RexPageUrlActiveEvent)
+      sendResponse({ success: true })
+      return true
+    }
+
     console.log('[rex-history] Received message:', message.messageType)
 
     if (message.messageType === 'triggerHistoryCollection') {

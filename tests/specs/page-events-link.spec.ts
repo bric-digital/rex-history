@@ -1,12 +1,12 @@
 import { test, expect, type Page } from '@playwright/test'
 
 /**
- * Verifies the optional linkage from rex-history to rex-page-events via the
- * globalThis.__rexPageEventsUrlActive seam.
+ * Verifies the optional linkage from rex-history to rex-page-events through
+ * `pageUrlActive` messages sent with rex-core's message handler.
  *
- * `?urlActive=on` on the test page installs a mock seam BEFORE the shim bundle
- * loads, so rex-history's setup() subscribes. Without the flag, the seam is
- * absent and no linkage happens — proving optional degradation.
+ * `?urlActive=on` on the test page defines `__emitUrlActive`, which sends a
+ * record as rex-page-events does. Without the flag, nothing is sent and no
+ * linkage happens, proving optional degradation.
  */
 
 async function waitForModuleSetup(page: Page) {
