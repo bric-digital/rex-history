@@ -154,7 +154,7 @@ If **rex-page-events** is installed alongside rex-history in the same extension,
 
 These fields let analysts join `rex-history-visit` records with `rex-page-event` records exactly: by `session_id` within a tab, or by `(url, page_events_url_shown_at ≈ visit_time)` at the visit level.
 
-**rex-history does not import `@bric/rex-page-events`.** At startup it probes `globalThis.__rexPageEventsUrlActive` — a tiny seam installed by rex-page-events' own service worker — and subscribes if present. If rex-page-events isn't bundled into the extension, the probe returns `undefined`, no subscription happens, and visits go out without the linkage fields. No error, no warning beyond a single info-level log line.
+**rex-history does not import `@bric/rex-page-events`.** rex-page-events sends each url-active record as a `pageUrlActive` message through rex-core's message handler, and rex-history keeps it in its buffer when it handles that message. If rex-page-events isn't bundled into the extension, no message arrives and visits go out without the linkage fields. No error, no warning.
 
 **Redacted URLs are never matched.** If rex-history's own filter/allow/domain_only lists would replace the visit's URL with `CATEGORY:…`, the linkage lookup short-circuits: no `tab_id` / `session_id` is stapled onto a redacted visit, even if a matching record exists in the buffer. Privacy-preserving by design.
 
@@ -164,7 +164,7 @@ These fields let analysts join `rex-history-visit` records with `rex-page-event`
 
 This module and `rex-page-events` use **two different kinds of coupling on purpose.**
 
-**Code — loosely coupled.** Neither module imports the other. Neither lists the other in `package.json` dependencies. The only connection is a convention: `rex-page-events` installs a `subscribe` function on `globalThis.__rexPageEventsUrlActive` at service-worker startup, and `rex-history` probes for it at its own startup. If the probe returns undefined (because `rex-page-events` wasn't included in the extension build), `rex-history` proceeds without linkage fields. Either module can ship, update, or be removed independently. The only shared surface is the `RexPageUrlActiveEvent` type in `@bric/rex-types`.
+**Code — loosely coupled.** Neither module imports the other. Neither lists the other in `package.json` dependencies. The only connection is a message: `rex-page-events` sends `pageUrlActive` through rex-core's message handler, and `rex-history` handles it. If `rex-page-events` wasn't included in the extension build, no message arrives and `rex-history` proceeds without linkage fields. Either module can ship, update, or be removed independently. The shared surfaces are the `pageUrlActive` message and the `RexPageUrlActiveEvent` type in `@bric/rex-types`.
 
 **Data — tightly coupled.** Once both modules are present, every `rex-history-visit` record that matches a buffered `rex-page-url-active` gets `tab_id`, `window_id`, `session_id`, and `page_events_url_shown_at` stapled onto it. A visit's `session_id` means exactly the same thing as the page-event's `session_id` for the same tab lifetime — analysts can treat the two streams as one correlated dataset, joining on `session_id` for exact-within-tab analysis or on `(url, page_events_url_shown_at ≈ visit_time)` for visit-level analysis.
 
