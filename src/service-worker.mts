@@ -207,8 +207,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
   /**
    * Find the most recent buffered url-active record matching the visit within
-   * tolerance. Returns null when: no match, tolerance is 0, URL is redacted
-   * (starts with `CATEGORY:`), or the seam was never wired up.
+   * tolerance. Returns null when: no match, tolerance is 0, or URL is redacted
+   * (starts with `CATEGORY:`).
    */
   private findUrlActiveMatch(url: string, visitTime: number): RexPageUrlActiveEvent | null {
     if (url.startsWith('CATEGORY:')) {
