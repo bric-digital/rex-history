@@ -86,6 +86,7 @@ interface HistoryConfig {
 }
 
 const URL_ACTIVE_BUFFER_MAX = 256
+const URL_ACTIVE_BUFFER_KEY = 'rexHistoryUrlActiveBuffer'
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
 const DEFAULT_COLLECTION_PAGE_SIZE = 1000
 const DEFAULT_LOOKBACK_DAYS = 90
@@ -128,6 +129,25 @@ interface HistoryStatus {
   effectiveConfig?: HistoryConfig;
 }
 
+async function loadUrlActiveBuffer(): Promise<RexPageUrlActiveEvent[]> {
+  try {
+    const stored = await chrome.storage.session.get(URL_ACTIVE_BUFFER_KEY)
+    return (stored[URL_ACTIVE_BUFFER_KEY] as RexPageUrlActiveEvent[] | undefined) ?? []
+  } catch (error) {
+    console.error('[rex-history] Could not load url-active records:', error)
+    return []
+  }
+}
+
+async function saveUrlActiveBuffer(buffer: RexPageUrlActiveEvent[]): Promise<RexPageUrlActiveEvent[]> {
+  try {
+    await chrome.storage.session.set({ [URL_ACTIVE_BUFFER_KEY]: buffer })
+  } catch (error) {
+    console.error('[rex-history] Could not save url-active records:', error)
+  }
+  return buffer
+}
+
 /**
  * History collection module - collects browser history with filtering and categorization
  */
@@ -140,9 +160,10 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
   /**
    * Ring buffer of observed `rex-page-url-active` records from rex-page-events,
-   * filled from `pageUrlActive` messages.
+   * filled from `pageUrlActive` messages. Kept in chrome.storage.session so it
+   * survives service worker restarts; each update waits for the one before it.
    */
-  private urlActiveBuffer: RexPageUrlActiveEvent[] = []
+  private urlActiveBuffer: Promise<RexPageUrlActiveEvent[]> = loadUrlActiveBuffer()
 
   /**
    * Guards against concurrent loadConfiguration() calls.
@@ -199,10 +220,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   // -------------------------------------------------------------------------
 
   private recordUrlActive(record: RexPageUrlActiveEvent): void {
-    this.urlActiveBuffer.push(record)
-    if (this.urlActiveBuffer.length > URL_ACTIVE_BUFFER_MAX) {
-      this.urlActiveBuffer.splice(0, this.urlActiveBuffer.length - URL_ACTIVE_BUFFER_MAX)
-    }
+    this.urlActiveBuffer = this.urlActiveBuffer.then((buffer) => {
+      return saveUrlActiveBuffer([...buffer, record].slice(-URL_ACTIVE_BUFFER_MAX))
+    })
   }
 
   /**
@@ -210,7 +230,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * tolerance. Returns null when: no match, tolerance is 0, or URL is redacted
    * (starts with `CATEGORY:`).
    */
-  private findUrlActiveMatch(url: string, visitTime: number): RexPageUrlActiveEvent | null {
+  private async findUrlActiveMatch(url: string, visitTime: number): Promise<RexPageUrlActiveEvent | null> {
     if (url.startsWith('CATEGORY:')) {
       return null // redacted visit — never try to un-redact via linkage
     }
@@ -221,7 +241,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
 
     let best: RexPageUrlActiveEvent | null = null
-    for (const record of this.urlActiveBuffer) {
+    for (const record of await this.urlActiveBuffer) {
       if (record.url !== url) continue
       if (Math.abs(visitTime - record.url_shown_at) > tolerance) continue
       if (best === null || record.url_shown_at > best.url_shown_at) {
@@ -1228,7 +1248,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         const matchUrl = recordedUrl.startsWith('CATEGORY:') || recordedUrl === ''
           ? recordedUrl
           : item.url
-        const linkMatch = this.findUrlActiveMatch(matchUrl, visit.visitTime)
+        const linkMatch = await this.findUrlActiveMatch(matchUrl, visit.visitTime)
         const linkFields = linkMatch !== null
           ? {
               tab_id: linkMatch.tab_id,

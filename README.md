@@ -154,7 +154,7 @@ If **rex-page-events** is installed alongside rex-history in the same extension,
 
 These fields let analysts join `rex-history-visit` records with `rex-page-event` records exactly: by `session_id` within a tab, or by `(url, page_events_url_shown_at ≈ visit_time)` at the visit level.
 
-**rex-history does not import `@bric/rex-page-events`.** rex-page-events sends each url-active record as a `pageUrlActive` message through rex-core's message handler, and rex-history keeps it in its buffer when it handles that message. If rex-page-events isn't bundled into the extension, no message arrives and visits go out without the linkage fields. No error, no warning.
+**rex-history does not import `@bric/rex-page-events`.** rex-page-events sends each url-active record as a `pageUrlActive` message through rex-core's message handler, and rex-history keeps it in its buffer when it handles that message. The buffer holds the latest 256 records in `chrome.storage.session` under `rexHistoryUrlActiveBuffer`, so it survives service worker restarts and is cleared when the browser closes. If rex-page-events isn't bundled into the extension, no message arrives and visits go out without the linkage fields. No error, no warning.
 
 **Redacted URLs are never matched.** If rex-history's own filter/allow/domain_only lists would replace the visit's URL with `CATEGORY:…`, the linkage lookup short-circuits: no `tab_id` / `session_id` is stapled onto a redacted visit, even if a matching record exists in the buffer. Privacy-preserving by design.
 
