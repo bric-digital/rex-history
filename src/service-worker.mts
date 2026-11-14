@@ -1,7 +1,15 @@
 import psl from 'psl'
 import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent } from '@bric/rex-core/service-worker'
 import type { REXConfiguration } from '@bric/rex-core/common'
+import type { RexVisitRecord } from '@bric/rex-types/types'
 import * as listUtils from '@bric/rex-lists'
+
+/** The emitted visit: the shared record plus what only rex-history adds. */
+interface HistoryVisitEvent extends RexVisitRecord {
+  [key: string]: unknown;
+  name: 'rex-history-visit';
+  categories: string[];
+}
 
 interface HistoryConfig {
   collect_after_install?: boolean;
@@ -1201,7 +1209,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         // Dispatch event to all modules (PDK will pick it up for upload)
         failedStep = 'dispatch'
         console.log('[rex-history] Logging event: rex-history-visit')
-        dispatchEvent({
+        const visitEvent: HistoryVisitEvent = {
           name: 'rex-history-visit',
           // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
           url: recordedUrl,
@@ -1248,7 +1256,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
                 matched_metadata: filterMatch.metadata || {}
               }
             : undefined,
-        })
+        }
+        dispatchEvent(visitEvent)
 
         collectedCount++
       }
