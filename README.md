@@ -120,7 +120,7 @@ This module requires:
 - **[@bric/rex-lists](https://github.com/bric-digital/rex-lists)** - List management and URL filtering (required)
 - **[@bric/webmunk-passive-data-kit](https://github.com/bric-digital/webmunk-passive-data-kit)** - Data transmission (required for data upload)
 
-`@bric/rex-types` supplies the `RexVisitRecord` type that `rex-history-visit` shares with `rex-browsing-visit`. `package.json` pins it to a commit on an unmerged rex-types branch; switch the pin back to `github:bric-digital/rex-types` once that pull request merges.
+`@bric/rex-types` supplies the `RexVisitRecord` type that `rex-history-visit` shares with `rex-browsing-visit`. `package.json` pins it to a commit on an unmerged rex-types branch; once that pull request merges, pin rex-types' release tag, or the merge commit on its main while rex-types has no tags.
 
 ## Installation
 
