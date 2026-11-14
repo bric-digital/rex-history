@@ -5,6 +5,7 @@ import * as listUtils from '@bric/rex-lists'
 import { type RexPageUrlActiveEvent } from '@bric/rex-types/types'
 
 interface HistoryConfig {
+  collect_after_install?: boolean;
   collection_interval_minutes: number;
   lookback_days: number;
   filter_lists: string[];
@@ -96,6 +97,7 @@ interface HistoryConfig {
 // ---------------------------------------------------------------------------
 
 const URL_ACTIVE_BUFFER_MAX = 256
+const COLLECTION_CUTOFF_KEY = 'rexHistoryCollectionCutoff'
 const DEFAULT_PAGE_EVENTS_LINK_TOLERANCE_MS = 5000
 const DEFAULT_COLLECTION_PAGE_SIZE = 1000
 const DEFAULT_LOOKBACK_DAYS = 90
@@ -552,6 +554,30 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     })
   }
 
+  /**
+   * Where collection stops when `collect_after_install` is false: the install
+   * time from rex-core, or, without one, the first collection's time, stored
+   * once so it never moves forward.
+   */
+  private async getCollectionCutoff(): Promise<number> {
+    const installTime = await this.getInstallTime()
+    if (installTime !== null) {
+      return installTime
+    }
+    try {
+      const stored = await chrome.storage.local.get(COLLECTION_CUTOFF_KEY)
+      if (typeof stored[COLLECTION_CUTOFF_KEY] === 'number') {
+        return stored[COLLECTION_CUTOFF_KEY] as number
+      }
+      const cutoff = Date.now()
+      await chrome.storage.local.set({ [COLLECTION_CUTOFF_KEY]: cutoff })
+      return cutoff
+    } catch (error) {
+      console.error('[rex-history] Could not read or store the collection cutoff:', error)
+      return Date.now()
+    }
+  }
+
   async getLastFetchTime(): Promise<number> {
     try {
       const result = await chrome.storage.local.get('webmunkHistoryLastFetch')
@@ -761,15 +787,18 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1000
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS
     const deadline = cycleNow + budgetMs
+    const walkEnd = this.config?.collect_after_install === false
+      ? Math.min(cycleNow, await this.getCollectionCutoff())
+      : cycleNow
 
     let cursor = await this.getLastFetchTime()
     cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs)
-    console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(cycleNow).toISOString()} (eager=${eager})`)
+    console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(walkEnd).toISOString()} (eager=${eager})`)
 
     let collectedCount = 0
     let windowsThisWake = 0
 
-    while (cursor < cycleNow) {
+    while (cursor < walkEnd) {
       // Always run at least one window per wake (windowsThisWake === 0) so a
       // zero/tiny budget still makes forward progress. After that, yield once
       // the wall-clock budget is spent.
@@ -777,7 +806,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         break
       }
 
-      const windowEnd = Math.min(cursor + windowMs, cycleNow)
+      const windowEnd = Math.min(cursor + windowMs, walkEnd)
       const result = await this.collectWindow(cursor, windowEnd, deadline)
       collectedCount += result.collectedCount
       cursor = result.advancedTo
@@ -788,7 +817,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       windowsThisWake++
     }
 
-    const caughtUp = cursor >= cycleNow
+    const caughtUp = cursor >= walkEnd
     console.log(`[rex-history] Collected ${collectedCount} visits across ${windowsThisWake} window(s); caughtUp=${caughtUp}`)
 
     if (caughtUp && this.config?.generate_top_domains) {

@@ -1366,6 +1366,113 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     expect(urls).toContain('https://within.example.com/')
   })
 
+  async function setupWithInstallTime(
+    page: import('@playwright/test').Page,
+    installTime: number | null,
+    overrides: Record<string, unknown>
+  ) {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    if (installTime !== null) {
+      await page.evaluate((installTime) => {
+        ;(window as any).chrome.storage.local._data.rexInstallTime = installTime
+      }, installTime)
+    }
+    await seedConfigAndIdentifier(page, overrides)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set((window as any).chrome.storage.local._data)
+    })
+    await page.waitForFunction(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  }
+
+  async function runCollection(page: import('@playwright/test').Page) {
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+  }
+
+  test('collect_after_install false: visits after install are not collected', async ({ page }) => {
+    const now = Date.now()
+    await setupWithInstallTime(page, now - 2 * DAY, {
+      lookback_days: 5, collection_window_hours: 24, collect_after_install: false
+    })
+    await addHistoryItem(page, 'https://beforeinstall.example.com/', 'BeforeInstall', now - 4 * DAY)
+    await addHistoryItem(page, 'https://afterinstall.example.com/', 'AfterInstall', now - 1 * DAY)
+
+    await runCollection(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://beforeinstall.example.com/')
+    expect(urls).not.toContain('https://afterinstall.example.com/')
+  })
+
+  test('collect_after_install absent: visits after install are collected', async ({ page }) => {
+    const now = Date.now()
+    await setupWithInstallTime(page, now - 2 * DAY, { lookback_days: 5, collection_window_hours: 24 })
+    await addHistoryItem(page, 'https://beforeinstall.example.com/', 'BeforeInstall', now - 4 * DAY)
+    await addHistoryItem(page, 'https://afterinstall.example.com/', 'AfterInstall', now - 1 * DAY)
+
+    await runCollection(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).toContain('https://beforeinstall.example.com/')
+    expect(urls).toContain('https://afterinstall.example.com/')
+  })
+
+  test('collect_after_install false: cursor already past install collects nothing more', async ({ page }) => {
+    const now = Date.now()
+    await setupWithInstallTime(page, now - 2 * DAY, {
+      lookback_days: 5, collection_window_hours: 24, collect_after_install: false
+    })
+    const cursor = now - 1 * DAY
+    await page.evaluate(async (cursor) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = cursor
+      await window.chrome.storage.local.set(data)
+    }, cursor)
+    await addHistoryItem(page, 'https://afterinstall.example.com/', 'AfterInstall', now - 12 * HOUR)
+
+    await runCollection(page)
+
+    const urls = await visitUrls(page)
+    expect(urls).not.toContain('https://afterinstall.example.com/')
+    const storedCursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    expect(storedCursor).toBe(cursor)
+  })
+
+  test('collect_after_install false: without install time the stored cutoff does not move', async ({ page }) => {
+    const now = Date.now()
+    await setupWithInstallTime(page, null, {
+      lookback_days: 7, collection_window_hours: 24, collect_after_install: false
+    })
+    await addHistoryItem(page, 'https://within.example.com/', 'Within', now - 3 * DAY)
+
+    await runCollection(page)
+    expect(await visitUrls(page)).toContain('https://within.example.com/')
+    const firstCutoff = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.rexHistoryCollectionCutoff as number
+    )
+    expect(typeof firstCutoff).toBe('number')
+
+    await addHistoryItem(page, 'https://afterfirstrun.example.com/', 'AfterFirstRun', firstCutoff + 1)
+    await page.waitForTimeout(50)
+    await page.evaluate(async () => {
+      ;(window as any).chrome.storage.local._data.webmunkHistoryStatus.lastCollectionTime = undefined
+    })
+    await runCollection(page)
+
+    expect(await visitUrls(page)).not.toContain('https://afterfirstrun.example.com/')
+    const secondCutoff = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.rexHistoryCollectionCutoff as number
+    )
+    expect(secondCutoff).toBe(firstCutoff)
+  })
+
   test('heavy window overflow emits a diagnostic and the cursor still advances', async ({ page }) => {
     // More than collection_page_size visits inside a single minute: window
     // splitting bottoms out at the 1-minute floor, so the walk collects the
