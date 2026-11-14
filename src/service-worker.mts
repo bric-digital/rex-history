@@ -844,7 +844,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         event_details: {
           collected_count: collectedCount,
           cursor,
-          target: cycleNow,
+          target: walkEnd,
           date: Date.now()
         }
       })

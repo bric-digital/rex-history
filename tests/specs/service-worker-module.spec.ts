@@ -1513,6 +1513,24 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     expect(storedCursor).toBe(installTime)
   })
 
+  test('collect_after_install false: progress reports the cutoff as its target', async ({ page }) => {
+    const now = Date.now()
+    const installTime = now - 2 * DAY
+    await setupWithInstallTime(page, installTime, {
+      lookback_days: 5, collection_window_hours: 1, collect_after_install: false, collection_walk_budget_ms: 0
+    })
+    await addHistoryItem(page, 'https://beforeinstall.example.com/', 'BeforeInstall', now - 4 * DAY)
+
+    await runCollection(page)
+
+    const progress = await page.evaluate(() =>
+      ((window as any).__capturedEvents as Record<string, any>[])
+        .filter((e) => e.event_name === 'rex-history-collection-progress')
+    )
+    expect(progress.length).toBe(1)
+    expect(progress[0].event_details.target).toBe(installTime)
+  })
+
   test('collect_after_install false: a stored cutoff wins over an install time recorded later', async ({ page }) => {
     await setupWithInstallTime(page, null, {
       lookback_days: 7, collection_window_hours: 24, collect_after_install: false
