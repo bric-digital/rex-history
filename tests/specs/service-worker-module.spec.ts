@@ -1473,6 +1473,68 @@ test.describe('HistoryServiceWorkerModule — Windowed collection walk', () => {
     expect(secondCutoff).toBe(firstCutoff)
   })
 
+  async function runCollectionAgain(page: import('@playwright/test').Page) {
+    await page.evaluate(async () => {
+      ;(window as any).chrome.storage.local._data.webmunkHistoryStatus.lastCollectionTime = undefined
+    })
+    await runCollection(page)
+  }
+
+  test('collect_after_install false: a cursor parked at the cutoff stays there across many wakes', async ({ page }) => {
+    const now = Date.now()
+    const installTime = now - 2 * DAY
+    await setupWithInstallTime(page, installTime, {
+      lookback_days: 5, collection_window_hours: 1, collect_after_install: false, collection_max_window_attempts: 2
+    })
+    await page.evaluate(async (cursor) => {
+      const data = (window as any).chrome.storage.local._data
+      data.webmunkHistoryLastFetch = cursor
+      await window.chrome.storage.local.set(data)
+    }, installTime)
+    await addHistoryItem(page, 'https://afterinstall.example.com/', 'AfterInstall', installTime + 30 * 60 * 1000)
+
+    const stuckEvents: unknown[] = []
+    const urls: string[] = []
+    await runCollection(page)
+    for (let wake = 0; wake < 5; wake++) {
+      stuckEvents.push(...await page.evaluate(() =>
+        ((window as any).__capturedEvents as Record<string, unknown>[])
+          .filter((e) => e.event_name === 'rex-history-walk-stuck')
+      ))
+      urls.push(...await visitUrls(page))
+      await runCollectionAgain(page)
+    }
+
+    expect(stuckEvents).toEqual([])
+    expect(urls).not.toContain('https://afterinstall.example.com/')
+    const storedCursor = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.webmunkHistoryLastFetch as number
+    )
+    expect(storedCursor).toBe(installTime)
+  })
+
+  test('collect_after_install false: a stored cutoff wins over an install time recorded later', async ({ page }) => {
+    await setupWithInstallTime(page, null, {
+      lookback_days: 7, collection_window_hours: 24, collect_after_install: false
+    })
+    await runCollection(page)
+    const firstCutoff = await page.evaluate(
+      () => (window as any).chrome.storage.local._data.rexHistoryCollectionCutoff as number
+    )
+
+    await addHistoryItem(page, 'https://beforeupdate.example.com/', 'BeforeUpdate', firstCutoff + 1)
+    await page.waitForTimeout(50)
+    await page.evaluate(async () => {
+      const data = (window as any).chrome.storage.local._data
+      data.rexInstallTime = Date.now()
+      await window.chrome.storage.local.set(data)
+    })
+    await page.waitForTimeout(50)
+    await runCollectionAgain(page)
+
+    expect(await visitUrls(page)).not.toContain('https://beforeupdate.example.com/')
+  })
+
   test('heavy window overflow emits a diagnostic and the cursor still advances', async ({ page }) => {
     // More than collection_page_size visits inside a single minute: window
     // splitting bottoms out at the 1-minute floor, so the walk collects the

@@ -557,24 +557,25 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   /**
    * Where collection stops when `collect_after_install` is false: the install
    * time from rex-core, or, without one, the first collection's time, stored
-   * once so it never moves forward.
+   * once so it never moves forward. A stored cutoff wins over an install time
+   * rex-core records later, since rex-core records one on update as well.
    */
   private async getCollectionCutoff(): Promise<number> {
-    const installTime = await this.getInstallTime()
-    if (installTime !== null) {
-      return installTime
-    }
     try {
       const stored = await chrome.storage.local.get(COLLECTION_CUTOFF_KEY)
       if (typeof stored[COLLECTION_CUTOFF_KEY] === 'number') {
         return stored[COLLECTION_CUTOFF_KEY] as number
+      }
+      const installTime = await this.getInstallTime()
+      if (installTime !== null) {
+        return installTime
       }
       const cutoff = Date.now()
       await chrome.storage.local.set({ [COLLECTION_CUTOFF_KEY]: cutoff })
       return cutoff
     } catch (error) {
       console.error('[rex-history] Could not read or store the collection cutoff:', error)
-      return Date.now()
+      return (await this.getInstallTime()) ?? Date.now()
     }
   }
 
@@ -792,7 +793,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       : cycleNow
 
     let cursor = await this.getLastFetchTime()
-    cursor = await this.advancePastStuckWindow(cursor, cycleNow, windowMs)
+    if (cursor < walkEnd) {
+      cursor = await this.advancePastStuckWindow(cursor, walkEnd, windowMs)
+    }
     console.log(`[rex-history] Walking history from ${new Date(cursor).toISOString()} toward ${new Date(walkEnd).toISOString()} (eager=${eager})`)
 
     let collectedCount = 0
