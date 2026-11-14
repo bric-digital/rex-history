@@ -2372,3 +2372,28 @@ test.describe('HistoryServiceWorkerModule — triggerHistoryCollection eagerness
     expect(await eagerAlarmArmed(page)).toBe(false)
   })
 })
+
+test.describe('HistoryServiceWorkerModule — No tab linkage', () => {
+  test('a visit record carries no rex-page-events tab fields', async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page)
+
+    const visitTime = Date.now() - 500
+    const url = 'https://untabbed.example/article'
+    await addHistoryItem(page, url, 'Untabbed', visitTime)
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const visit = await page.evaluate(() => {
+      const events = (window as any).__capturedEvents as Record<string, unknown>[]
+      return events.find((e) => e.name === 'rex-history-visit' && String(e.url).includes('untabbed.example'))
+    })
+    expect(visit).toBeDefined()
+    expect(visit).not.toHaveProperty('tab_id')
+    expect(visit).not.toHaveProperty('window_id')
+    expect(visit).not.toHaveProperty('session_id')
+    expect(visit).not.toHaveProperty('page_events_url_shown_at')
+  })
+})
