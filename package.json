@@ -38,7 +38,7 @@
     "dependencies": {
         "@bric/rex-core": "github:bric-digital/rex-core",
         "@bric/rex-lists": "github:bric-digital/rex-lists#a9c38eb04072a224aaf6963d89989e4acbc8ef95",
-        "@bric/rex-types": "github:bric-digital/rex-types#83c5ee6a05e5174121f3e239ad7b3f41eac90fde",
+        "@bric/rex-types": "github:bric-digital/rex-types#acf4601c247ce2fe463e22b167bbd24f681326f8",
         "psl": "^1.9.0"
     },
     "allowScripts": {
