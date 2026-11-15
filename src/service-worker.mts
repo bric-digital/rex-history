@@ -471,16 +471,18 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * once so it never moves forward. A stored cutoff wins over an install time
    * rex-core records later, since rex-core records one on update as well.
    */
-  private async getCollectionCutoff(): Promise<number> {
+  private async readOrStoreCollectionCutoff(): Promise<number> {
     try {
       const stored = await chrome.storage.local.get(COLLECTION_CUTOFF_KEY)
       if (typeof stored[COLLECTION_CUTOFF_KEY] === 'number') {
         return stored[COLLECTION_CUTOFF_KEY] as number
       }
+
       const installTime = await this.getInstallTime()
       if (installTime !== null) {
         return installTime
       }
+
       const cutoff = Date.now()
       await chrome.storage.local.set({ [COLLECTION_CUTOFF_KEY]: cutoff })
       return cutoff
@@ -699,9 +701,11 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     const windowMs = (this.config?.collection_window_hours ?? DEFAULT_COLLECTION_WINDOW_HOURS) * 60 * 60 * 1000
     const budgetMs = this.config?.collection_walk_budget_ms ?? DEFAULT_WALK_BUDGET_MS
     const deadline = cycleNow + budgetMs
-    const walkEnd = this.config?.collect_after_install === false
-      ? Math.min(cycleNow, await this.getCollectionCutoff())
-      : cycleNow
+    let walkEnd = cycleNow
+
+    if (this.config?.collect_after_install === false) {
+      walkEnd = Math.min(cycleNow, await this.readOrStoreCollectionCutoff())
+    }
 
     let cursor = await this.getLastFetchTime()
     if (cursor < walkEnd) {
