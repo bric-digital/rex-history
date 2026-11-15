@@ -15,10 +15,9 @@
  * All tests share one browser context (beforeAll / afterAll) with serial execution
  * to avoid the MV3 service-worker registration race.
  *
- * IMPORTANT — headless mode:
- *   Chrome's CDP bridge does not expose extension service workers in headless mode.
- *   Tests use headless: false. On macOS/Windows a small window appears during the
- *   run; on Linux CI wrap in Xvfb.
+ * Runs in Chrome's new headless mode (`channel: 'chromium'`), which loads
+ * extensions and exposes their service workers, so no window opens. Plain
+ * `headless: true` does not expose them. `npm run test:headed` shows the window.
  */
 
 import { test, expect, chromium, type BrowserContext, type Worker } from '@playwright/test'
@@ -94,7 +93,7 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
     userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-history-ext-'))
 
     context = await chromium.launchPersistentContext(userDataDir, {
-      headless: false,
+      channel: 'chromium',
       args: [
         `--disable-extensions-except=${extensionPath}`,
         `--load-extension=${extensionPath}`,
@@ -581,7 +580,7 @@ test.describe('HistoryServiceWorkerModule — first-install profile', () => {
     try {
       // Phase 1: seed browsing history WITHOUT the extension loaded.
       const preseedContext = await chromium.launchPersistentContext(userDataDir, {
-        headless: false,
+        channel: 'chromium',
         args: [
           `--host-resolver-rules=${HOST_RESOLVER_RULES}`,
         ],
@@ -596,7 +595,7 @@ test.describe('HistoryServiceWorkerModule — first-install profile', () => {
 
       // Phase 2: load extension into the same profile and trigger collection.
       const extensionContext = await chromium.launchPersistentContext(userDataDir, {
-        headless: false,
+        channel: 'chromium',
         args: [
           `--disable-extensions-except=${extensionPath}`,
           `--load-extension=${extensionPath}`,
