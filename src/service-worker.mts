@@ -772,7 +772,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * window and emit a server-visible diagnostic. Losing at most one window
    * beats the field failure mode of losing everything from the wedge onward.
    */
-  private async advancePastStuckWindow(cursor: number, cycleNow: number, windowMs: number): Promise<number> {
+  private async advancePastStuckWindow(cursor: number, walkEnd: number, windowMs: number): Promise<number> {
     try {
       const stored = await chrome.storage.local.get(WALK_ATTEMPT_KEY)
       const attempt = stored[WALK_ATTEMPT_KEY] as
@@ -793,7 +793,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         return cursor
       }
 
-      const skippedTo = Math.min(cursor + windowMs, cycleNow)
+      const skippedTo = Math.min(cursor + windowMs, walkEnd)
       console.error(`[rex-history] Walk stuck at ${new Date(cursor).toISOString()} after ${attempt.attempts} attempts — skipping to ${new Date(skippedTo).toISOString()}`)
       dispatchEvent({
         name: 'pdk-app-event',
