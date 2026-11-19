@@ -456,7 +456,7 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     expect(events[0]!.domain).toBe('example.co.uk')
   })
 
-  test('an IP address has no registered domain', async ({ page }) => {
+  test('an IP address is recorded as its own domain', async ({ page }) => {
     const now = Date.now()
     await addHistoryItem(page, 'http://192.168.0.1/admin', 'Router', now - 500)
 
@@ -472,6 +472,36 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     )
 
     expect(events.length).toBeGreaterThanOrEqual(1)
+    expect(events[0]!.domain).toBe('192.168.0.1')
+  })
+
+  test('an address with no host has no domain', async ({ page }) => {
+    const now = Date.now()
+    await seedConfigAndIdentifier(page, { record_all_urls: true })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.effectiveConfig?.record_all_urls === true,
+      { timeout: 5_000 }
+    )
+    await addHistoryItem(page, 'about:blank', 'Blank', now - 500)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit' && e.url === 'about:blank'
+        )
+    )
+
+    expect(events).toHaveLength(1)
     expect(events[0]!.domain).toBe('not available')
   })
 

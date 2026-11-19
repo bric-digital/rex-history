@@ -1122,8 +1122,9 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * The registered domain of a URL, or 'not available' when it has none,
-   * as for an IP address or an unparseable URL. Never throws.
+   * The registered domain of a URL, the host itself when the host has no
+   * registered domain, as for an IP address, or 'not available' when the URL
+   * has no host or cannot be parsed. Never throws.
    */
   private safeRegisteredDomain(url: string): string {
     const registeredDomain = listUtils.registeredDomainOf(url)

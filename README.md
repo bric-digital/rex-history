@@ -56,7 +56,7 @@ This module reads from the `history` section of the backend config.
 
 ### Recorded fields
 
-Every visit produces a `rex-history-visit` record. Its `url`, `recorded_url` and `title` are what Chrome reports, and `domain` is the registered domain (`not available` when there is none). A visit above `max_visits_per_url` is recorded as a `rex-history-visit-aggregate` record with the same fields. rex-history does not hide, shorten or replace any part of an address, and no list changes a record's address, title or domain. A record collected before its category lists have loaded has an empty `categories` list.
+Every visit produces a `rex-history-visit` record. Its `url`, `recorded_url` and `title` are what Chrome reports, and `domain` is the registered domain, or the host itself when the host has no registered domain (an IP address, `localhost`), or `not available` when the address has no host. A visit above `max_visits_per_url` is recorded as a `rex-history-visit-aggregate` record with the same fields. rex-history does not hide, shorten or replace any part of an address, and no list changes a record's address, title or domain. A record collected before its category lists have loaded has an empty `categories` list.
 
 ### Category Lists (`category_lists`)
 
