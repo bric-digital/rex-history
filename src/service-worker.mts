@@ -1339,6 +1339,38 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return true
     }
 
+    if (message.messageType === 'resetHistoryCollection') {
+      // Rewind the walk cursor to its first-run seed and re-collect. Callers
+      // should expect already-collected visits to be re-emitted; pairing this
+      // with clearing downstream storage is the caller's decision.
+      //
+      // An in-flight collection must finish first: collectHistory() silently
+      // no-ops while isCollecting is true, and the in-flight walk would write
+      // the cursor right back — turning the reset into a data-clearing no-op.
+      console.log('[rex-history] Resetting collection cursor and re-collecting (eager)')
+
+      const waitForIdle = (): Promise<void> => {
+        if (this.status.isCollecting === false) {
+          return Promise.resolve()
+        }
+
+        return new Promise((resolve) => {
+          setTimeout(() => { waitForIdle().then(resolve) }, 250)
+        })
+      }
+
+      waitForIdle()
+        .then(() => chrome.storage.local.remove('webmunkHistoryLastFetch'))
+        .then(() => this.collectHistory(true))
+        .then(() => {
+          sendResponse({ success: true })
+        })
+        .catch((error) => {
+          sendResponse({ success: false, error: error.message })
+        })
+      return true
+    }
+
     if (message.messageType === 'getHistoryStatus') {
       console.log('[rex-history] Sending status:', this.status)
       sendResponse(this.status)

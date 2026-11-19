@@ -77,6 +77,12 @@ To keep less of an address, add a content processor that runs after collection. 
 
 The `category_lists` field references list names defined in the `lists` configuration section. See [rex-lists](https://github.com/bric-digital/rex-lists) for list format documentation.
 
+## Messages
+
+### `resetHistoryCollection`
+
+Restarts collection from the first-run starting point (`lookback_days` before the install time). It waits for a collection in progress to finish, then collects again, so every visit from that point is emitted again. Records already collected are not touched: the caller decides whether to clear or keep them. The response is `{ success: true }` once the first collection pass after the reset ends.
+
 ## Dependencies
 
 This module requires:
