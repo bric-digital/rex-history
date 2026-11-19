@@ -3,6 +3,7 @@ import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent
 import type { REXConfiguration } from '@bric/rex-core/common'
 import type { RexVisitRecord } from '@bric/rex-types/types'
 import * as listUtils from '@bric/rex-lists'
+import { listsLoaded } from '@bric/rex-lists/service-worker'
 
 /** The emitted visit: the shared record plus what only rex-history adds. */
 interface HistoryVisitEvent extends RexVisitRecord {
@@ -317,7 +318,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (hasCategoryLists === false) {
       this.status.listsReady = true
     } else {
-      this.status.listsReady = await listUtils.listsLoaded()
+      this.status.listsReady = await listsLoaded()
     }
   }
 
