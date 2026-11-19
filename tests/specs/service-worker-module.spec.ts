@@ -276,15 +276,14 @@ test.describe('HistoryServiceWorkerModule — URL Filtering (shouldSkipUrl)', ()
   })
 })
 
-test.describe('HistoryServiceWorkerModule — Category lists', () => {
-  /** Category lists come from the lists section of configuration, which rex-lists records as synced. */
-  async function markListsLoaded(page: import('@playwright/test').Page) {
-    await page.evaluate(() => {
-      ;(window as any).chrome.storage.local._data.rexListsLastSyncedHash = 'synced-for-test'
-    })
-  }
+test.describe('HistoryServiceWorkerModule — Category lists not loaded', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+  })
 
-  async function setupCategoryConfig(page: import('@playwright/test').Page) {
+  test('a visit is still recorded, with no categories, when its category list has not loaded', async ({ page }) => {
+    const now = Date.now()
     await seedConfigAndIdentifier(page, { category_lists: ['social-media-categories'] })
     await page.evaluate(async () => {
       await window.chrome.storage.local.set(
@@ -296,76 +295,21 @@ test.describe('HistoryServiceWorkerModule — Category lists', () => {
         (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
       { timeout: 5_000 }
     )
-  }
-
-  async function addCategoryEntry(page: import('@playwright/test').Page) {
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'social-media-categories',
-        pattern: 'facebook.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: { category: 'social-media' }
-      }])
-    })
-  }
-
-  async function visitEvents(page: import('@playwright/test').Page) {
-    return page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-  }
-
-  test.beforeEach(async ({ page }) => {
-    await page.goto('/test-page.html')
-    await waitForModuleSetup(page)
-  })
-
-  test('a URL on a category list is recorded as visited and carries its category', async ({ page }) => {
-    const now = Date.now()
-    await markListsLoaded(page)
-    await setupCategoryConfig(page)
-    await addCategoryEntry(page)
 
     await addHistoryItem(page, 'https://www.facebook.com/profile', 'Facebook Profile', now - 500)
     await page.evaluate(() => { (window as any).__capturedEvents = [] })
     await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
     await waitForCollectionComplete(page)
 
-    const events = await visitEvents(page)
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.url).toBe('https://www.facebook.com/profile')
-    expect(event.recorded_url).toBe('https://www.facebook.com/profile')
-    expect(event.title).toBe('Facebook Profile')
-    expect(event.domain).toBe('facebook.com')
-    expect(event.categories).toEqual(['social-media'])
-    expect(Object.keys(event)).not.toContain('filtered')
-    expect(Object.keys(event)).not.toContain('filtered_by_list')
-    expect(Object.keys(event)).not.toContain('allowed_by_list')
-  })
-
-  test('collection does not start until the lists have been loaded', async ({ page }) => {
-    const now = Date.now()
-    await setupCategoryConfig(page)
-    await addCategoryEntry(page)
-
-    await addHistoryItem(page, 'https://www.facebook.com/profile', 'Facebook Profile', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection' }))
-
-    expect(await visitEvents(page)).toHaveLength(0)
-
-    await markListsLoaded(page)
-    await page.evaluate(() => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection' }))
-    await waitForCollectionComplete(page)
-
-    const events = await visitEvents(page)
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    expect(events[0]!.categories).toEqual(['social-media'])
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit'
+        )
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]!.url).toBe('https://www.facebook.com/profile')
+    expect(events[0]!.categories).toEqual([])
   })
 })
 

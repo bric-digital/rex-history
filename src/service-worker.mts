@@ -200,7 +200,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return
       if (changes.REXConfiguration || changes.rexIdentifier) {
-        // Use loadConfigOnly to avoid racing with collection cycles.
         this.loadConfigOnly()
           .then(async () => {
             const hasIdentifier = await this.hasIdentifier()
@@ -217,12 +216,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
     })
 
-    // Load status from storage before configuration so that listsReady
-    // persisted from a previous run is available before the alarm can fire.
+    // Load status from storage before configuration so that the persisted
+    // status is available before the alarm can fire.
     await this.loadStatus()
 
-    // Load configuration. loadConfigurationImpl sets listsReady once the
-    // category lists have been loaded.
+    // Load configuration. loadConfigurationImpl reports in listsReady whether
+    // the category lists have been loaded.
     await this.loadConfiguration()
 
     // Set up periodic collection alarm ONLY if identifier exists
@@ -311,7 +310,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     }
   }
 
-  private async refreshListsReady(): Promise<boolean> {
+  private async refreshListsReady(): Promise<void> {
     const categoryLists = this.config?.category_lists
     const hasCategoryLists = categoryLists !== undefined && categoryLists.length > 0
 
@@ -320,8 +319,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     } else {
       this.status.listsReady = await listUtils.listsLoaded()
     }
-
-    return this.status.listsReady
   }
 
   async setupAlarm() {
@@ -541,15 +538,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (this.status.isCollecting) {
       console.log('[rex-history] Collection already in progress, skipping')
       return Promise.resolve()
-    }
-
-    if (!this.status.listsReady) {
-      console.log('[rex-history] Lists not yet loaded, skipping collection')
-      return this.refreshListsReady().then((listsReady) => {
-        if (listsReady) {
-          return this.collectHistory(eager)
-        }
-      })
     }
 
     // Set the flag synchronously BEFORE any async work so that concurrent

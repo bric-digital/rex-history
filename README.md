@@ -21,7 +21,7 @@ This module reads from the `history` section of the backend config.
 - `rex-history` reads its module configuration from rex-core (`REXConfiguration.history`).
 - It does **not** support a module-local configuration override key in storage.
 - Category matching (`category_lists`) uses list names from `history` config and resolves entries from the shared lists database (`@bric/rex-lists`).
-- The extension must import `@bric/rex-lists/service-worker`, which loads the `lists` section of the configuration into that database. Collection waits until the lists have been loaded when `category_lists` is not empty.
+- The extension must import `@bric/rex-lists/service-worker`, which loads the `lists` section of the configuration into that database. Collection does not wait for the lists.
 - User edits made through `rex-lists-front-end` are immediately visible to category matching for those configured list names.
 
 ### Schema
@@ -56,7 +56,7 @@ This module reads from the `history` section of the backend config.
 
 ### Recorded fields
 
-Every visit produces a `rex-history-visit` record. Its `url`, `recorded_url` and `title` are what Chrome reports, and `domain` is the registered domain (`not available` when there is none). A visit above `max_visits_per_url` is recorded as a `rex-history-visit-aggregate` record with the same fields. rex-history does not hide, shorten or replace any part of an address, and no list changes what a record contains.
+Every visit produces a `rex-history-visit` record. Its `url`, `recorded_url` and `title` are what Chrome reports, and `domain` is the registered domain (`not available` when there is none). A visit above `max_visits_per_url` is recorded as a `rex-history-visit-aggregate` record with the same fields. rex-history does not hide, shorten or replace any part of an address, and no list changes a record's address, title or domain. A record collected before its category lists have loaded has an empty `categories` list.
 
 ### Category Lists (`category_lists`)
 
