@@ -160,26 +160,24 @@ export async function waitForConfigurationLoaded(serviceWorker: ServiceWorkerLik
  */
 export async function injectConfigAndIdentifier(
   serviceWorker: ServiceWorkerLike,
-  overrides: Record<string, unknown> = {}
+  overrides: Record<string, unknown> = {},
+  lists: Record<string, unknown[]> = {}
 ): Promise<void> {
-  await serviceWorker.evaluate(async (historyConfig) => {
-    await chrome.storage.local.set({
-      rexIdentifier: 'rex-history-test-user',
-      REXConfiguration: {
-        history: historyConfig,
-      },
-    })
+  await serviceWorker.evaluate(async (input) => {
+    await chrome.storage.local.set({ rexIdentifier: 'rex-history-test-user' })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (self as any).__updateConfiguration({ history: input.historyConfig, lists: input.lists })
   }, {
-    collection_interval_minutes: 60,
-    lookback_days: 30,
-    filter_lists: [],
-    allow_lists: [],
-    category_lists: [],
-    domain_only_lists: [],
-    generate_top_domains: false,
-    top_domains_count: 50,
-    top_domains_list_name: 'top-domains',
-    ...overrides,
+    historyConfig: {
+      collection_interval_minutes: 60,
+      lookback_days: 30,
+      category_lists: [],
+      generate_top_domains: false,
+      top_domains_count: 50,
+      top_domains_list_name: 'top-domains',
+      ...overrides,
+    },
+    lists,
   })
 
   await waitForConfigurationLoaded(serviceWorker)
@@ -210,69 +208,4 @@ export async function waitForCapturedEvent(
   return serviceWorker.evaluate(
     () => (self as any).__capturedEvents as Record<string, unknown>[] // eslint-disable-line @typescript-eslint/no-explicit-any
   ) as Promise<Record<string, unknown>[]>
-}
-
-/**
- * Write list entries directly to IndexedDB inside the service worker context.
- * Equivalent to a server-side list sync, but done inline for module tests.
- */
-export async function injectListEntries(
-  serviceWorker: ServiceWorkerLike,
-  entries: Array<{ list_name: string; pattern: string; pattern_type: string; metadata?: Record<string, unknown> }>
-): Promise<void> {
-  await serviceWorker.evaluate(async (rows) => {
-    // Open the DB at whatever version the rex-lists module already created.
-    // Do NOT specify a version number here — opening at a higher version would
-    // trigger onupgradeneeded which would conflict with rex-lists' own migration logic.
-    await new Promise<void>((resolve, reject) => {
-      const openRequest = indexedDB.open('webmunk_lists')
-      openRequest.onerror = () => reject(new Error('Failed to open webmunk_lists'))
-      openRequest.onsuccess = () => {
-        const db = openRequest.result
-        const tx = db.transaction(['list_entries'], 'readwrite')
-        const store = tx.objectStore('list_entries')
-
-        // Clear all existing entries for each list name being written, so
-        // repeated calls across tests don't hit the unique index constraint.
-        const listNames = [...new Set(rows.map((r) => r.list_name))]
-        const listNameIndex = store.index('list_name')
-        let pendingDeletes = listNames.length
-
-        const writeRows = () => {
-          // Write entries compatible with both v3 (domain field) and v4 (pattern field).
-          for (const row of rows) {
-            store.add({
-              list_name: row.list_name,
-              domain: row.pattern,   // v3 field name
-              pattern: row.pattern,  // v4 field name
-              pattern_type: row.pattern_type,
-              source: 'backend',
-              metadata: row.metadata ?? {},
-            })
-          }
-        }
-
-        if (pendingDeletes === 0) {
-          writeRows()
-        } else {
-          for (const listName of listNames) {
-            const cursorRequest = listNameIndex.openCursor(IDBKeyRange.only(listName))
-            cursorRequest.onsuccess = () => {
-              const cursor = cursorRequest.result
-              if (cursor) {
-                cursor.delete()
-                cursor.continue()
-              } else {
-                pendingDeletes--
-                if (pendingDeletes === 0) writeRows()
-              }
-            }
-          }
-        }
-
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(new Error('Transaction failed'))
-      }
-    })
-  }, entries)
 }

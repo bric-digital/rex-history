@@ -3,6 +3,7 @@ import rexCorePlugin, { REXServiceWorkerModule, registerREXModule, dispatchEvent
 import type { REXConfiguration } from '@bric/rex-core/common'
 import type { RexVisitRecord } from '@bric/rex-types/types'
 import * as listUtils from '@bric/rex-lists'
+import { listsLoaded } from '@bric/rex-lists/service-worker'
 
 /** The emitted visit: the shared record plus what only rex-history adds. */
 interface HistoryVisitEvent extends RexVisitRecord {
@@ -15,10 +16,7 @@ interface HistoryConfig {
   collect_after_install?: boolean;
   collection_interval_minutes: number;
   lookback_days: number;
-  filter_lists: string[];
-  allow_lists: string[];
   category_lists: string[];
-  domain_only_lists: string[];
   generate_top_domains: boolean;
   top_domains_count: number;
   top_domains_list_name: string;
@@ -139,15 +137,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * Guards against concurrent loadConfiguration() calls.
-   *
-   * loadConfiguration() calls parseAndSyncLists() which deletes-then-reinserts
-   * IndexedDB entries.  If two calls overlap (e.g. storage.onChanged fires
-   * while collectHistory's own loadConfiguration is mid-sync), the second
-   * delete can wipe entries the first call just inserted, leaving allow-lists
-   * temporarily empty during a collection cycle.
-   *
-   * By coalescing overlapping calls into a single promise we avoid the race.
+   * Guards against concurrent loadConfiguration() calls by coalescing
+   * overlapping calls into a single promise.
    */
   private loadConfigurationPromise: Promise<void> | null = null
 
@@ -168,15 +159,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    */
   private visitCache: Map<string, chrome.history.VisitItem[]> | null = null
   private visitCacheSize = 0
-
-  /**
-   * DEV-ONLY debug flag:
-   * When enabled (and running inside Webmunk Dev Extension), we emit a dataset event
-   * containing the *full* original URL for filtered items so you can verify list behavior.
-   *
-   * This is explicitly blocked outside the dev extension to prevent accidental deployment.
-   */
-  private static readonly DEBUG_LOG_FILTERED_URLS_KEY = 'webmunk_debug_log_filtered_urls'
 
   private recordAllUrls:boolean = false
 
@@ -219,11 +201,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'local') return
       if (changes.REXConfiguration || changes.rexIdentifier) {
-        // Use loadConfigOnly (no list sync) to avoid racing with collection
-        // cycles.  parseAndSyncLists temporarily empties lists during its
-        // delete-then-reinsert cycle; if that overlaps with a collection the
-        // allow-list check misclassifies visits.  Lists are synced inside
-        // collectHistory() instead, where the timing is controlled.
         this.loadConfigOnly()
           .then(async () => {
             const hasIdentifier = await this.hasIdentifier()
@@ -240,15 +217,12 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
     })
 
-    // Load status from storage before configuration so that listsReady
-    // persisted from a previous run is available before the alarm can fire.
+    // Load status from storage before configuration so that the persisted
+    // status is available before the alarm can fire.
     await this.loadStatus()
 
-    // Load configuration and sync lists. loadConfigurationImpl sets
-    // listsReady once at least one allow-list has entries in IndexedDB.
-    // On a service worker restart with a pre-populated DB, loadStatus()
-    // above already restored listsReady: true so collection isn't blocked
-    // while the re-sync runs.
+    // Load configuration. loadConfigurationImpl reports in listsReady whether
+    // the category lists have been loaded.
     await this.loadConfiguration()
 
     // Set up periodic collection alarm ONLY if identifier exists
@@ -282,7 +256,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     if (this.loadConfigurationPromise) {
       return this.loadConfigurationPromise
     }
-    this.loadConfigurationPromise = this.loadConfigurationImpl(true)
+    this.loadConfigurationPromise = this.loadConfigurationImpl()
     try {
       await this.loadConfigurationPromise
     } finally {
@@ -291,17 +265,14 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * Reload history config from rex-core WITHOUT re-syncing lists.
-   *
-   * collectHistory() calls this instead of loadConfiguration() so that a
-   * concurrent parseAndSyncLists (which temporarily empties lists) cannot
-   * race with the collection cycle's allow-list checks.
+   * Reload history config from rex-core without going through the
+   * loadConfiguration() guard.
    */
   private async loadConfigOnly() {
-    await this.loadConfigurationImpl(false)
+    await this.loadConfigurationImpl()
   }
 
-  private async loadConfigurationImpl(syncLists: boolean) {
+  private async loadConfigurationImpl() {
     try {
       // Always fetch through rex-core, which owns configuration loading/storage.
       const configuration = await rexCorePlugin.fetchConfiguration() as REXConfiguration | undefined
@@ -331,38 +302,23 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         this.recordAllUrls = false
       }
 
-      const allowLists = this.config?.allow_lists
-
-      if (!allowLists || allowLists.length === 0) {
-        this.status.listsReady = true
-      } else {
-        const checks = await Promise.all(allowLists.map((name) => listUtils.hasListEntries(name)))
-        if (checks.some(Boolean)) {
-          this.status.listsReady = true
-        }
-      }
-
-      if (!syncLists) return
-
-      const listConfig = configurationRecord?.['lists']
-      if (listConfig !== null && listConfig !== undefined && typeof listConfig === 'object' && !Array.isArray(listConfig)) {
-        await listUtils.parseAndSyncLists(listConfig as Parameters<typeof listUtils.parseAndSyncLists>[0])
-        console.log('[rex-history] Lists synced.')
-      }
-
-      if (!allowLists || allowLists.length === 0) {
-        this.status.listsReady = true
-      } else {
-        const checks = await Promise.all(allowLists.map((name) => listUtils.hasListEntries(name)))
-        if (checks.some(Boolean)) {
-          this.status.listsReady = true
-        }
-      }
+      await this.refreshListsReady()
 
       await this.saveStatus()
 
     } catch (error) {
       console.error('[rex-history] Failed to load configuration:', error)
+    }
+  }
+
+  private async refreshListsReady(): Promise<void> {
+    const categoryLists = this.config?.category_lists
+    const hasCategoryLists = categoryLists !== undefined && categoryLists.length > 0
+
+    if (hasCategoryLists === false) {
+      this.status.listsReady = true
+    } else {
+      this.status.listsReady = await listsLoaded()
     }
   }
 
@@ -585,14 +541,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       return Promise.resolve()
     }
 
-    if (!this.status.listsReady) {
-      console.log('[rex-history] Lists not yet synced, skipping collection')
-      return Promise.resolve()
-    }
-
     // Set the flag synchronously BEFORE any async work so that concurrent
-    // callers (e.g. storage.onChanged → loadConfiguration) see isCollecting
-    // immediately and skip the destructive parseAndSyncLists cycle.
+    // callers see isCollecting immediately.
     this.status.isCollecting = true
 
     // IMPORTANT: Do not collect or send data until user has entered an identifier
@@ -602,9 +552,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           console.warn('[rex-history] No identifier set - collection will not start until identifier is provided')
           return Promise.reject(new Error('NO_IDENTIFIER'))
         }
-        // Full loadConfiguration (with list sync) is safe here because
-        // isCollecting is already true, which prevents the storage.onChanged
-        // listener from starting a concurrent list sync.
         return this.loadConfiguration()
       })
       .then(() => this.waitForConfiguration())
@@ -967,87 +914,22 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * How a URL may be recorded, before any visit is attached.
+   * How a URL is recorded, before any visit is attached.
    *
-   * Every branch here depends on the URL alone, so an aggregate record for a URL
-   * whose visits are never enumerated resolves exactly as an individual visit
-   * would. Two emitters, one privacy precedence: domain-only wins outright, then
-   * a configured allow-list that does not match redacts, then a filter-list
-   * match redacts to its category.
+   * The address and title are recorded as Chrome reports them, so an aggregate
+   * record for a URL whose visits are never enumerated resolves exactly as an
+   * individual visit would.
    */
-  private async resolveRecordedUrl(
-    item: chrome.history.HistoryItem,
-    context: { visit_id?: string; visit_time?: number; history_item_id?: string }
-  ): Promise<{
+  private resolveRecordedUrl(item: chrome.history.HistoryItem): {
     recordedUrl: string;
     recordedTitle: string;
     registeredDomain: string;
-    filteredByList: string | undefined;
-    filterMatch: listUtils.ListEntry | undefined;
-    allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry };
-  }> {
+  } {
     const url = item.url ?? ''
 
-    // Extract registered domain from URL using psl
-    let registeredDomain = 'not available'
-    try {
-      const urlObj = new URL(url)
-      const hostname = urlObj.hostname
-      const parsed = psl.parse(hostname)
-      if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-        registeredDomain = parsed.domain
-      }
-    } catch {
-      // Keep default 'not available' for invalid URLs
-    }
+    const registeredDomain = this.safeRegisteredDomain(url)
 
-    let recordedUrl: string
-    let recordedTitle = item.title || ''
-    let filteredByList: string | undefined
-    let filterMatch: listUtils.ListEntry | undefined
-
-    // Apply domain_only_lists FIRST: takes precedence over allow_lists.
-    // URLs on a domain_only_list are always collected at domain resolution,
-    // regardless of allow_list membership.
-    const domainOnlyResult = await this.applyDomainOnlyLists(url, context)
-
-    let allowCheck: { allowed: boolean; matchedList?: string; matchEntry?: listUtils.ListEntry }
-
-    if (domainOnlyResult.filteredByList) {
-      recordedUrl = 'DOMAIN ONLY'
-      recordedTitle = 'DOMAIN ONLY'
-      filteredByList = domainOnlyResult.filteredByList
-      filterMatch = domainOnlyResult.filterMatch
-      allowCheck = { allowed: true }
-      // registeredDomain stays as-is (domain preserved — that's the point of domain_only)
-    } else {
-      // Apply allow_lists: if configured, only collect URLs matching an allow-list.
-      // If not allowed, create a dummy record (like blocklist behavior).
-      allowCheck = await this.checkAllowLists(url)
-
-      if (!allowCheck.allowed) {
-        // URL not on allowlist - create dummy record with category placeholder
-        recordedUrl = 'CATEGORY:NOT_ON_ALLOWLIST'
-        recordedTitle = ''
-        registeredDomain = ''
-        // Log debug event if enabled (dev-only)
-        await this.maybeLogFilteredUrlDebug(url, recordedUrl, 'NOT_ON_ALLOWLIST', undefined, context)
-      } else {
-        // Apply filter_lists to produce a privacy-preserving recorded URL (but still upload the visit).
-        const filterResult = await this.applyFilterLists(url, context)
-        recordedUrl = filterResult.recordedUrl
-        filteredByList = filterResult.filteredByList
-        filterMatch = filterResult.filterMatch
-
-        // Privacy: if we masked the URL, mask the title and domain too.
-        if (recordedUrl.startsWith('CATEGORY:')) {
-          recordedTitle = ''
-          registeredDomain = ''
-        }
-      }
-    }
-
-    return { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck }
+    return { recordedUrl: url, recordedTitle: item.title || '', registeredDomain }
   }
 
   /**
@@ -1070,8 +952,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
    * Names a URL that a ceiling would have aggregated, while it is still being
    * collected in full.
    *
-   * The address goes through the same redaction the record would, so turning
-   * warning on cannot disclose a URL that collection itself would have masked.
+   * The address is recorded as the visit record would record it.
    */
   private async emitCeilingDiagnostic(
     item: chrome.history.HistoryItem,
@@ -1079,7 +960,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     windowEnd: number
   ): Promise<void> {
     try {
-      const resolved = await this.resolveRecordedUrl(item, { history_item_id: item.id })
+      const resolved = this.resolveRecordedUrl(item)
 
       dispatchEvent({
         name: 'pdk-app-event',
@@ -1113,7 +994,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
     windowStart: number,
     windowEnd: number
   ): Promise<void> {
-    const resolved = await this.resolveRecordedUrl(item, { history_item_id: item.id })
+    const resolved = this.resolveRecordedUrl(item)
     const categories = await this.categorizeUrl(item.url ?? '')
 
     console.log(`[rex-history] Logging event: rex-history-visit-aggregate (${item.visitCount} visits)`)
@@ -1134,11 +1015,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       history_item_id: item.id,
       last_visit_time: item.lastVisitTime,
       visit_count: item.visitCount,
-      typed_count: item.typedCount,
-
-      allowed_by_list: resolved.allowCheck.matchedList,
-      filtered: Boolean(resolved.filteredByList),
-      filtered_by_list: resolved.filteredByList
+      typed_count: item.typedCount
     })
   }
 
@@ -1199,12 +1076,8 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         }
 
         failedStep = 'list-matching'
-        const resolved = await this.resolveRecordedUrl(item, {
-          visit_id: visit.visitId,
-          visit_time: visit.visitTime,
-          history_item_id: item.id
-        })
-        const { recordedUrl, recordedTitle, registeredDomain, filteredByList, filterMatch, allowCheck } = resolved
+        const resolved = this.resolveRecordedUrl(item)
+        const { recordedUrl, recordedTitle, registeredDomain } = resolved
 
         // Categorize against category lists
         failedStep = 'categorize'
@@ -1215,7 +1088,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
         console.log('[rex-history] Logging event: rex-history-visit')
         const visitEvent: HistoryVisitEvent = {
           name: 'rex-history-visit',
-          // IMPORTANT: `url` is the recorded URL (may be replaced by CATEGORY:... for filtered items)
           url: recordedUrl,
           recorded_url: recordedUrl,
           domain: registeredDomain,
@@ -1234,32 +1106,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
           history_item_id: item.id,
           last_visit_time: item.lastVisitTime,
           visit_count: item.visitCount,
-          typed_count: item.typedCount,
-
-          // Allow-list context (which list allowed this URL)
-          allowed_by_list: allowCheck.matchedList,
-          allowed_by_list_entry: allowCheck.matchEntry
-            ? {
-                list_name: allowCheck.matchedList,
-                matched_pattern: allowCheck.matchEntry.pattern,
-                matched_pattern_type: allowCheck.matchEntry.pattern_type,
-                matched_source: allowCheck.matchEntry.source,
-                matched_metadata: allowCheck.matchEntry.metadata || {}
-              }
-            : undefined,
-
-          // Filter-list context (safe: doesn't include original URL)
-          filtered: Boolean(filteredByList),
-          filtered_by_list: filteredByList,
-          filtered_by_list_entry: filterMatch
-            ? {
-                list_name: filteredByList,
-                matched_pattern: filterMatch.pattern,
-                matched_pattern_type: filterMatch.pattern_type,
-                matched_source: filterMatch.source,
-                matched_metadata: filterMatch.metadata || {}
-              }
-            : undefined,
+          typed_count: item.typedCount
         }
         dispatchEvent(visitEvent)
 
@@ -1275,19 +1122,18 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * Extract the registered domain from a URL using psl, returning 'not available'
-   * for anything unparseable. Never throws.
+   * The registered domain of a URL, the host itself when the host has no
+   * registered domain, as for an IP address, or 'not available' when the URL
+   * has no host or cannot be parsed. Never throws.
    */
   private safeRegisteredDomain(url: string): string {
-    try {
-      const parsed = psl.parse(new URL(url).hostname)
-      if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-        return parsed.domain
-      }
-    } catch {
-      // fall through to default
+    const registeredDomain = listUtils.registeredDomainOf(url)
+
+    if (registeredDomain === '') {
+      return 'not available'
     }
-    return 'not available'
+
+    return registeredDomain
   }
 
   /**
@@ -1355,7 +1201,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
   /**
    * Privacy baseline: skip URLs we should never collect/upload at all.
-   * (Filter lists are handled separately and do NOT skip; they replace recorded URL.)
    */
   private shouldSkipUrl(url: string): boolean {
     if (this.recordAllUrls) {
@@ -1364,161 +1209,6 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
 
     // Only allow http(s) by default (privacy).
     return !(url.startsWith('http://') || url.startsWith('https://'))
-  }
-
-  /**
-   * Check if URL is allowed by the allow_lists.
-   *
-   * If allow_lists is configured and non-empty, only URLs matching at least one
-   * allow-list entry will be collected. URLs not on an allow-list are skipped entirely.
-   *
-   * Returns { allowed: true, matchedList, matchEntry } if allowed, or { allowed: false } if not.
-   */
-  private async checkAllowLists(url: string): Promise<{
-    allowed: boolean;
-    matchedList?: string;
-    matchEntry?: listUtils.ListEntry;
-  }> {
-    if (!this.config) {
-      return { allowed: true }
-    }
-
-    const allowLists = this.config.allow_lists
-    if (!allowLists || allowLists.length === 0) {
-      // No allow-lists configured = allow everything (default behavior)
-      return { allowed: true }
-    }
-
-    // Check each allow-list for a match
-    for (const listName of allowLists) {
-      try {
-        const match = await listUtils.matchDomainAgainstList(url, listName)
-        if (match) {
-          console.log(`[rex-history] URL allowed by list ${listName}: ${url}`)
-          return { allowed: true, matchedList: listName, matchEntry: match }
-        }
-      } catch (error) {
-        console.error(`[rex-history] Error checking allow list ${listName}:`, error)
-      }
-    }
-
-    // No match found in any allow-list = skip this URL
-    console.log(`[rex-history] URL not in allow-lists, skipping: ${url}`)
-    return { allowed: false }
-  }
-
-  /**
-   * Apply configured filter lists to a URL.
-   *
-   * If a match is found, we replace the recorded URL with `CATEGORY:<category|null>` so the visit
-   * can still be uploaded without the full URL. The original URL can still be inspected via the
-   * dev-only debug event (guarded by manifest name + storage flag).
-   */
-  private async applyFilterLists(
-    url: string,
-    ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
-  ): Promise<{ recordedUrl: string; filteredByList?: string; filterMatch?: listUtils.ListEntry }> {
-    if (!this.config || !this.config.filter_lists) {
-      return { recordedUrl: url }
-    }
-
-    for (const listName of this.config.filter_lists) {
-      try {
-        const match = await listUtils.matchDomainAgainstList(url, listName)
-        if (match) {
-          const category = (match.metadata?.category as string | undefined) ?? null
-          const recordedUrl = `CATEGORY:${category ?? 'null'}`
-
-          console.log(`[rex-history] Filtered URL by list ${listName} -> ${recordedUrl}`)
-
-          await this.maybeLogFilteredUrlDebug(url, recordedUrl, listName, match, ctx)
-          return { recordedUrl, filteredByList: listName, filterMatch: match }
-        }
-      } catch (error) {
-        console.error(`[rex-history] Error checking filter list ${listName}:`, error)
-      }
-    }
-
-    return { recordedUrl: url }
-  }
-
-  /**
-   * Apply configured domain_only_lists to a URL.
-   *
-   * If a match is found, we replace the recorded URL and title with "DOMAIN ONLY" while preserving
-   * the registered domain field. This allows researchers to know which domain was visited without
-   * exposing the full URL or page title.
-   */
-  private async applyDomainOnlyLists(
-    url: string,
-    ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
-  ): Promise<{ filteredByList?: string; filterMatch?: listUtils.ListEntry }> {
-    if (!this.config || !this.config.domain_only_lists) {
-      return {}
-    }
-
-    for (const listName of this.config.domain_only_lists) {
-      try {
-        const match = await listUtils.matchDomainAgainstList(url, listName)
-        if (match) {
-          console.log(`[rex-history] Applied domain-only filter by list ${listName}`)
-
-          await this.maybeLogFilteredUrlDebug(url, 'DOMAIN ONLY', listName, match, ctx)
-          return { filteredByList: listName, filterMatch: match }
-        }
-      } catch (error) {
-        console.error(`[rex-history] Error checking domain-only list ${listName}:`, error)
-      }
-    }
-
-    return {}
-  }
-
-  private isDevExtension(): boolean {
-    try {
-      return chrome.runtime.getManifest().name === 'Webmunk Dev Extension'
-    } catch {
-      return false
-    }
-  }
-
-  private async maybeLogFilteredUrlDebug(
-    url: string,
-    recordedUrl: string,
-    listName: string,
-    match: listUtils.ListEntry | undefined,
-    ctx: { visit_id?: string; visit_time?: number; history_item_id?: string }
-  ): Promise<void> {
-    // Hard safety gate: never allow full-URL debug logging outside the dev extension.
-    const { [HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY]: enabled } =
-      await chrome.storage.local.get(HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY)
-
-    if (!this.isDevExtension()) {
-      if (enabled === true) {
-        console.warn('[rex-history] Debug URL logging was enabled, but this is not the dev extension. Disabling.')
-        await chrome.storage.local.remove(HistoryServiceWorkerModule.DEBUG_LOG_FILTERED_URLS_KEY)
-      }
-      return
-    }
-
-    if (enabled !== true) return
-
-    // Emit a debug event that Passive Data Kit will capture.
-    dispatchEvent({
-      name: 'webmunk-history-filtered-url-debug',
-      url,
-      recorded_url: recordedUrl,
-      filtered_by_list: listName === 'NOT_ON_ALLOWLIST' ? undefined : listName,
-      allowed_by_list: listName === 'NOT_ON_ALLOWLIST' ? 'NOT_ON_ALLOWLIST' : undefined,
-      matched_pattern: match?.pattern,
-      matched_pattern_type: match?.pattern_type,
-      matched_source: match?.source,
-      matched_metadata: match?.metadata || {},
-      visit_id: ctx.visit_id,
-      visit_time: ctx.visit_time,
-      history_item_id: ctx.history_item_id,
-      date: Date.now()
-    })
   }
 
   async categorizeUrl(url: string): Promise<string[]> {
@@ -1646,6 +1336,44 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }).catch((error) => {
         sendResponse({ success: false, error: error.message })
       })
+      return true
+    }
+
+    if (message.messageType === 'resetHistoryCollection') {
+      // Rewind the walk cursor to its first-run seed and re-collect. Callers
+      // should expect already-collected visits to be re-emitted; pairing this
+      // with clearing downstream storage is the caller's decision.
+      //
+      // An in-flight collection must finish first: collectHistory() silently
+      // no-ops while isCollecting is true, and the in-flight walk would write
+      // the cursor right back — turning the reset into a data-clearing no-op.
+      console.log('[rex-history] Resetting collection cursor and re-collecting (eager)')
+
+      const waitForIdle = (): Promise<void> => {
+        if (this.status.isCollecting === false) {
+          return Promise.resolve()
+        }
+
+        return new Promise((resolve) => {
+          setTimeout(() => { waitForIdle().then(resolve) }, 250)
+        })
+      }
+
+      waitForIdle()
+        .then(() => chrome.storage.local.remove(['webmunkHistoryLastFetch', WALK_ATTEMPT_KEY]))
+        .then(() => {
+          // A reset restarts the count from zero; leaving the lifetime tally
+          // makes a rescan look like it doubled the collected items.
+          this.status.itemsCollected = 0
+          return this.saveStatus()
+        })
+        .then(() => this.collectHistory(true))
+        .then(() => {
+          sendResponse({ success: true })
+        })
+        .catch((error) => {
+          sendResponse({ success: false, error: error.message })
+        })
       return true
     }
 

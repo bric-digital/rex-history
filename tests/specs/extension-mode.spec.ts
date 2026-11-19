@@ -3,7 +3,7 @@
  *
  * These tests load the history module as a real Chrome extension with real Chrome APIs
  * (chrome.alarms, chrome.history, chrome.storage, IndexedDB). All URL visits use fake
- * domains (news.me, block.me, social.me) mapped to 127.0.0.1 via --host-resolver-rules,
+ * domains (news.me, block.me, social.me, dashboard.example.com) mapped to 127.0.0.1 via --host-resolver-rules,
  * served by the local test server (tests/scripts/run-server.js on port 3001).
  *
  * The sw-entry.mts shim registers an EventCaptureModule that populates
@@ -33,7 +33,6 @@ import {
   waitForHistoryEntries,
   waitForConfigurationLoaded,
   injectConfigAndIdentifier,
-  injectListEntries,
   resetCapturedEvents,
   waitForCapturedEvent,
 } from '../utils/extension.js'
@@ -50,6 +49,7 @@ const HOST_RESOLVER_RULES = [
   'MAP *.block.me 127.0.0.1',
   'MAP social.me 127.0.0.1',
   'MAP *.social.me 127.0.0.1',
+  'MAP dashboard.example.com 127.0.0.1',
 ].join(', ')
 
 // ---------------------------------------------------------------------------
@@ -220,22 +220,16 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Allow list — event payload assertions
+  // Addresses are recorded as Chrome reports them
   // -------------------------------------------------------------------------
 
-  test('URL on allow list is collected with full URL in event payload', async () => {
-    await injectConfigAndIdentifier(serviceWorker, { allow_lists: ['news-sites'] })
-    await injectListEntries(serviceWorker, [{
-      list_name: 'news-sites',
-      pattern: 'news.me',
-      pattern_type: 'domain',
-    }])
-    await waitForAllowListEntry(serviceWorker, 'news-sites', 'news.me', 'domain')
+  test('a visit is recorded with the address Chrome reports', async () => {
+    await injectConfigAndIdentifier(serviceWorker)
     await prepareManualHistoryCollection(serviceWorker)
     await resetCapturedEvents(serviceWorker)
 
-    const marker = `allow-full-${Date.now()}`
-    const targetUrl = `http://alpha.news.me:${SERVER_PORT}/allowlisted?marker=${marker}`
+    const marker = `as-reported-${Date.now()}`
+    const targetUrl = `http://dashboard.example.com:${SERVER_PORT}/private/page?q=1&marker=${marker}`
     await visitUrl(context, targetUrl)
     await waitForHistoryEntries(serviceWorker, [marker])
     await triggerHistoryCollection(serviceWorker)
@@ -243,122 +237,18 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
     const events = await waitForCapturedEvent(
       serviceWorker,
       (e) => isHistoryVisit(e) && hasMarker(e, marker),
-      `Expected allowlisted event with marker=${marker}`
+      `Expected rex-history-visit with marker=${marker}`
     )
 
     const event = events.find((e) => isHistoryVisit(e) && hasMarker(e, marker))!
     expect(event.url).toBe(targetUrl)
-    expect(event.domain).toBe('news.me')
-  })
-
-  test('URL not on allow list records as CATEGORY:NOT_ON_ALLOWLIST with domain and title cleared', async () => {
-    await injectConfigAndIdentifier(serviceWorker, { allow_lists: ['news-sites'] })
-    await injectListEntries(serviceWorker, [{
-      list_name: 'news-sites',
-      pattern: 'news.me',
-      pattern_type: 'domain',
-    }])
-    await waitForAllowListEntry(serviceWorker, 'news-sites', 'news.me', 'domain')
-    await prepareManualHistoryCollection(serviceWorker)
-    await resetCapturedEvents(serviceWorker)
-
-    const visitStart = Date.now()
-    const marker = `not-allowed-${Date.now()}`
-    await visitUrl(context, `http://delta.block.me:${SERVER_PORT}/not-allowlisted?marker=${marker}`)
-    await waitForHistoryEntries(serviceWorker, [marker])
-    await triggerHistoryCollection(serviceWorker)
-
-    // The event url will be CATEGORY:NOT_ON_ALLOWLIST — match by visit_time window instead of marker
-    const events = await waitForCapturedEvent(
-      serviceWorker,
-      (e) => {
-        if (!isHistoryVisit(e)) return false
-        const t = Number(e.visit_time)
-        return e.url === 'CATEGORY:NOT_ON_ALLOWLIST' && t >= visitStart - 2000
-      },
-      'Expected CATEGORY:NOT_ON_ALLOWLIST event in visit time window'
-    )
-
-    const event = events.find((e) => {
-      if (!isHistoryVisit(e)) return false
-      const t = Number(e.visit_time)
-      return e.url === 'CATEGORY:NOT_ON_ALLOWLIST' && t >= visitStart - 2000
-    })!
-    expect(event.url).toBe('CATEGORY:NOT_ON_ALLOWLIST')
-    expect(event.domain).toBe('')
-    expect(event.title).toBe('')
-  })
-
-  // -------------------------------------------------------------------------
-  // Filter list — event payload assertions
-  // -------------------------------------------------------------------------
-
-  test('URL matching a filter list records as CATEGORY:<category> with domain and title cleared', async () => {
-    await injectConfigAndIdentifier(serviceWorker, { filter_lists: ['sensitive-sites'] })
-    await injectListEntries(serviceWorker, [{
-      list_name: 'sensitive-sites',
-      pattern: 'social.me',
-      pattern_type: 'domain',
-      metadata: { category: 'social-media' },
-    }])
-    await prepareManualHistoryCollection(serviceWorker)
-    await resetCapturedEvents(serviceWorker)
-
-    const visitStart = Date.now()
-    const marker = `filter-cat-${Date.now()}`
-    await visitUrl(context, `http://alpha.social.me:${SERVER_PORT}/allowlisted?marker=${marker}`)
-    await waitForHistoryEntries(serviceWorker, [marker])
-    await triggerHistoryCollection(serviceWorker)
-
-    const events = await waitForCapturedEvent(
-      serviceWorker,
-      (e) => {
-        if (!isHistoryVisit(e)) return false
-        const t = Number(e.visit_time)
-        return e.url === 'CATEGORY:social-media' && t >= visitStart - 2000
-      },
-      'Expected CATEGORY:social-media event'
-    )
-
-    const event = events.find((e) => e.url === 'CATEGORY:social-media')!
-    expect(event.url).toBe('CATEGORY:social-media')
-    expect(event.domain).toBe('')
-    expect(event.title).toBe('')
-  })
-
-  // -------------------------------------------------------------------------
-  // Domain-only list — event payload assertions
-  // -------------------------------------------------------------------------
-
-  test('URL on domain_only list records as "DOMAIN ONLY" but preserves domain field', async () => {
-    await injectConfigAndIdentifier(serviceWorker, { domain_only_lists: ['domain-only-sites'] })
-    await injectListEntries(serviceWorker, [{
-      list_name: 'domain-only-sites',
-      pattern: 'social.me',
-      pattern_type: 'domain',
-    }])
-    await prepareManualHistoryCollection(serviceWorker)
-    await resetCapturedEvents(serviceWorker)
-
-    const visitStart = Date.now()
-    const marker = `domonly-${Date.now()}`
-    await visitUrl(context, `http://alpha.social.me:${SERVER_PORT}/allowlisted?marker=${marker}`)
-    await waitForHistoryEntries(serviceWorker, [marker])
-    await triggerHistoryCollection(serviceWorker)
-
-    const events = await waitForCapturedEvent(
-      serviceWorker,
-      (e) => {
-        if (!isHistoryVisit(e)) return false
-        const t = Number(e.visit_time)
-        return e.url === 'DOMAIN ONLY' && t >= visitStart - 2000
-      },
-      'Expected DOMAIN ONLY event'
-    )
-
-    const event = events.find((e) => e.url === 'DOMAIN ONLY')!
-    expect(event.url).toBe('DOMAIN ONLY')
-    expect(event.domain).toBe('social.me')
+    expect(event.recorded_url).toBe(targetUrl)
+    expect(event.domain).toBe('example.com')
+    expect(Object.keys(event)).not.toContain('filtered')
+    expect(Object.keys(event)).not.toContain('filtered_by_list')
+    expect(Object.keys(event)).not.toContain('filtered_by_list_entry')
+    expect(Object.keys(event)).not.toContain('allowed_by_list')
+    expect(Object.keys(event)).not.toContain('allowed_by_list_entry')
   })
 
   // -------------------------------------------------------------------------
@@ -366,13 +256,14 @@ test.describe('HistoryServiceWorkerModule — real extension', () => {
   // -------------------------------------------------------------------------
 
   test('URL matching a category list has correct category in event payload', async () => {
-    await injectConfigAndIdentifier(serviceWorker, { category_lists: ['site-categories'] })
-    await injectListEntries(serviceWorker, [{
-      list_name: 'site-categories',
-      pattern: 'news.me',
-      pattern_type: 'domain',
-      metadata: { category: 'news' },
-    }])
+    await injectConfigAndIdentifier(serviceWorker, { category_lists: ['site-categories'] }, {
+      'site-categories': [{
+        pattern: 'news.me',
+        pattern_type: 'domain',
+        metadata: { category: 'news' },
+      }],
+    })
+    await waitForAllowListEntry(serviceWorker, 'site-categories', 'news.me', 'domain')
     await prepareManualHistoryCollection(serviceWorker)
     await resetCapturedEvents(serviceWorker)
 
@@ -620,7 +511,7 @@ test.describe('HistoryServiceWorkerModule — first-install profile', () => {
           throw new Error('setup() did not complete within 10s')
         })
 
-        // Inject config so allow_lists is empty (collect everything) and reset cursor.
+        // Inject config and reset cursor.
         await sw.evaluate(async () => {
           await chrome.storage.local.set({
             rexIdentifier: 'first-install-test-user',
@@ -628,10 +519,7 @@ test.describe('HistoryServiceWorkerModule — first-install profile', () => {
               history: {
                 collection_interval_minutes: 60,
                 lookback_days: 30,
-                filter_lists: [],
-                allow_lists: [],
                 category_lists: [],
-                domain_only_lists: [],
                 generate_top_domains: false,
                 top_domains_count: 50,
                 top_domains_list_name: 'top-domains',

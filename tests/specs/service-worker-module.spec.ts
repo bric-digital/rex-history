@@ -32,10 +32,7 @@ async function seedConfigAndIdentifier(
       history: {
         collection_interval_minutes: 60,
         lookback_days: 7,
-        filter_lists: [],
-        allow_lists: [],
         category_lists: [],
-        domain_only_lists: [],
         generate_top_domains: false,
         top_domains_count: 50,
         top_domains_list_name: 'top-domains',
@@ -279,19 +276,15 @@ test.describe('HistoryServiceWorkerModule — URL Filtering (shouldSkipUrl)', ()
   })
 })
 
-test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => {
-  /** Set up config with allow_lists + domain_only_lists and trigger module reload. */
-  async function setupDomainOnlyConfig(
-    page: import('@playwright/test').Page,
-    overrides: Record<string, unknown> = {}
-  ) {
-    await seedConfigAndIdentifier(page, {
-      allow_lists: ['study-sites'],
-      filter_lists: [],
-      domain_only_lists: ['domain-only-sites'],
-      category_lists: [],
-      ...overrides
-    })
+test.describe('HistoryServiceWorkerModule — Category lists not loaded', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+  })
+
+  test('a visit is still recorded, with no categories, when its category list has not loaded', async ({ page }) => {
+    const now = Date.now()
+    await seedConfigAndIdentifier(page, { category_lists: ['social-media-categories'] })
     await page.evaluate(async () => {
       await window.chrome.storage.local.set(
         (window as any).chrome.storage.local._data
@@ -302,27 +295,6 @@ test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => 
         (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
       { timeout: 5_000 }
     )
-  }
-
-  test.beforeEach(async ({ page }) => {
-    await page.goto('/test-page.html')
-    await waitForModuleSetup(page)
-  })
-
-  test('domain-only list URL records as "DOMAIN ONLY" even when not on allow_list', async ({ page }) => {
-    const now = Date.now()
-    await setupDomainOnlyConfig(page)
-
-    // Populate domain-only list. study-sites has no entries, so facebook.com fails allow_list check.
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'domain-only-sites',
-        pattern: 'facebook.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: {}
-      }])
-    })
 
     await addHistoryItem(page, 'https://www.facebook.com/profile', 'Facebook Profile', now - 500)
     await page.evaluate(() => { (window as any).__capturedEvents = [] })
@@ -335,359 +307,9 @@ test.describe('HistoryServiceWorkerModule — Domain-Only List Behavior', () => 
           (e) => e.name === 'rex-history-visit'
         )
     )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.url).toBe('DOMAIN ONLY')
-    expect(event.recorded_url).toBe('DOMAIN ONLY')
-  })
-
-  test('domain-only list URL preserves domain field', async ({ page }) => {
-    const now = Date.now()
-    await setupDomainOnlyConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'domain-only-sites',
-        pattern: 'facebook.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: {}
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.facebook.com/profile', 'Facebook Profile', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.domain).toBe('facebook.com')
-  })
-
-  test('domain-only list URL gets categories populated when also in category list', async ({ page }) => {
-    const now = Date.now()
-    await setupDomainOnlyConfig(page, { category_lists: ['social-media-categories'] })
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([
-        {
-          list_name: 'domain-only-sites',
-          pattern: 'facebook.com',
-          pattern_type: 'domain',
-          source: 'server',
-          metadata: {}
-        },
-        {
-          list_name: 'social-media-categories',
-          pattern: 'facebook.com',
-          pattern_type: 'domain',
-          source: 'server',
-          metadata: { category: 'social-media' }
-        }
-      ])
-    })
-
-    await addHistoryItem(page, 'https://www.facebook.com/profile', 'Facebook Profile', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.url).toBe('DOMAIN ONLY')
-    expect(event.domain).toBe('facebook.com')
-    expect(Array.isArray(event.categories)).toBe(true)
-    expect((event.categories as string[])).toContain('social-media')
-  })
-})
-
-test.describe('HistoryServiceWorkerModule — Filter Lists', () => {
-  async function setupFilterConfig(
-    page: import('@playwright/test').Page,
-    overrides: Record<string, unknown> = {}
-  ) {
-    await seedConfigAndIdentifier(page, {
-      filter_lists: ['sensitive-sites'],
-      allow_lists: [],
-      category_lists: [],
-      domain_only_lists: [],
-      ...overrides
-    })
-    await page.evaluate(async () => {
-      await window.chrome.storage.local.set(
-        (window as any).chrome.storage.local._data
-      )
-    })
-    await page.waitForFunction(
-      () =>
-        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
-      { timeout: 5_000 }
-    )
-  }
-
-  test.beforeEach(async ({ page }) => {
-    await page.goto('/test-page.html')
-    await waitForModuleSetup(page)
-  })
-
-  test('URL matching a filter list records as CATEGORY:<category>', async ({ page }) => {
-    const now = Date.now()
-    await setupFilterConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'sensitive-sites',
-        pattern: 'reddit.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: { category: 'social-media' }
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.reddit.com/r/news', 'Reddit News', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.url).toBe('CATEGORY:social-media')
-    expect(event.recorded_url).toBe('CATEGORY:social-media')
-  })
-
-  test('filtered URL has domain and title cleared', async ({ page }) => {
-    const now = Date.now()
-    await setupFilterConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'sensitive-sites',
-        pattern: 'reddit.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: { category: 'social-media' }
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.reddit.com/r/news', 'Reddit News', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.domain).toBe('')
-    expect(event.title).toBe('')
-  })
-
-  test('URL not matching any filter list passes through unmodified', async ({ page }) => {
-    const now = Date.now()
-    await setupFilterConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'sensitive-sites',
-        pattern: 'reddit.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: { category: 'social-media' }
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.example.com/page', 'Example', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit' && (e.url as string).includes('example.com')
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    expect(events[0]!.url).toBe('https://www.example.com/page')
-    expect(events[0]!.domain).toBe('example.com')
-  })
-
-  test('filter list entry with no category metadata records as CATEGORY:null', async ({ page }) => {
-    const now = Date.now()
-    await setupFilterConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'sensitive-sites',
-        pattern: 'example.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: {}
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.example.com/page', 'Example', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    expect(events[0]!.url).toBe('CATEGORY:null')
-  })
-})
-
-test.describe('HistoryServiceWorkerModule — Allow Lists', () => {
-  async function setupAllowConfig(
-    page: import('@playwright/test').Page,
-    overrides: Record<string, unknown> = {}
-  ) {
-    await seedConfigAndIdentifier(page, {
-      allow_lists: ['study-sites'],
-      filter_lists: [],
-      category_lists: [],
-      domain_only_lists: [],
-      ...overrides
-    })
-    await page.evaluate(async () => {
-      await window.chrome.storage.local.set(
-        (window as any).chrome.storage.local._data
-      )
-    })
-    await page.waitForFunction(
-      () =>
-        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
-      { timeout: 5_000 }
-    )
-  }
-
-  test.beforeEach(async ({ page }) => {
-    await page.goto('/test-page.html')
-    await waitForModuleSetup(page)
-  })
-
-  test('URL on allow list is collected with full URL', async ({ page }) => {
-    const now = Date.now()
-    await setupAllowConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'study-sites',
-        pattern: 'bbc.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: {}
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.bbc.com/news/article', 'BBC News', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    expect(events[0]!.url).toBe('https://www.bbc.com/news/article')
-  })
-
-  test('URL not on allow list records as CATEGORY:NOT_ON_ALLOWLIST', async ({ page }) => {
-    const now = Date.now()
-    await setupAllowConfig(page)
-
-    await page.evaluate(async () => {
-      await (window as any).__listUtils.bulkCreateListEntries([{
-        list_name: 'study-sites',
-        pattern: 'bbc.com',
-        pattern_type: 'domain',
-        source: 'server',
-        metadata: {}
-      }])
-    })
-
-    await addHistoryItem(page, 'https://www.example.com/page', 'Example', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    const event = events[0]!
-    expect(event.url).toBe('CATEGORY:NOT_ON_ALLOWLIST')
-    expect(event.domain).toBe('')
-    expect(event.title).toBe('')
-  })
-
-  test('no allow list configured collects all URLs', async ({ page }) => {
-    const now = Date.now()
-    // No allow_lists = allow everything
-    await seedConfigAndIdentifier(page, {
-      allow_lists: [],
-      filter_lists: [],
-      category_lists: [],
-      domain_only_lists: []
-    })
-    await page.evaluate(async () => {
-      await window.chrome.storage.local.set(
-        (window as any).chrome.storage.local._data
-      )
-    })
-    await page.waitForFunction(
-      () =>
-        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
-      { timeout: 5_000 }
-    )
-
-    await addHistoryItem(page, 'https://www.random-site.com/', 'Random', now - 500)
-    await page.evaluate(() => { (window as any).__capturedEvents = [] })
-    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
-    await waitForCollectionComplete(page)
-
-    const events = await page.evaluate(
-      () =>
-        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
-          (e) => e.name === 'rex-history-visit'
-        )
-    )
-    expect(events.length).toBeGreaterThanOrEqual(1)
-    expect(events[0]!.url).toBe('https://www.random-site.com/')
+    expect(events).toHaveLength(1)
+    expect(events[0]!.url).toBe('https://www.facebook.com/profile')
+    expect(events[0]!.categories).toEqual([])
   })
 })
 
@@ -832,6 +454,55 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     expect(events.length).toBeGreaterThanOrEqual(1)
     // psl should extract the registered domain, not the full hostname
     expect(events[0]!.domain).toBe('example.co.uk')
+  })
+
+  test('an IP address is recorded as its own domain', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'http://192.168.0.1/admin', 'Router', now - 500)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit' && (e.url as string).includes('192.168.0.1')
+        )
+    )
+
+    expect(events.length).toBeGreaterThanOrEqual(1)
+    expect(events[0]!.domain).toBe('192.168.0.1')
+  })
+
+  test('an address with no host has no domain', async ({ page }) => {
+    const now = Date.now()
+    await seedConfigAndIdentifier(page, { record_all_urls: true })
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.effectiveConfig?.record_all_urls === true,
+      { timeout: 5_000 }
+    )
+    await addHistoryItem(page, 'about:blank', 'Blank', now - 500)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit' && e.url === 'about:blank'
+        )
+    )
+
+    expect(events).toHaveLength(1)
+    expect(events[0]!.domain).toBe('not available')
   })
 
   test('collection does not run when no identifier is set', async ({ page }) => {
@@ -2289,6 +1960,9 @@ test.describe('HistoryServiceWorkerModule — Visits-per-URL ceiling', () => {
 
     const aggregate = result.aggregates[0]!
     expect(aggregate.url).toBe(BUSY)
+    expect(aggregate.recorded_url).toBe(BUSY)
+    expect(Object.keys(aggregate)).not.toContain('filtered')
+    expect(Object.keys(aggregate)).not.toContain('allowed_by_list')
     expect(aggregate.visit_count).toBe(440_000)
     expect(typeof aggregate.window_start).toBe('number')
     expect(typeof aggregate.window_end).toBe('number')
@@ -2303,6 +1977,7 @@ test.describe('HistoryServiceWorkerModule — Visits-per-URL ceiling', () => {
     expect(result.warnings.length).toBeGreaterThan(0)
 
     const details = result.warnings[0]!.event_details as Record<string, unknown>
+    expect(details.recorded_url).toBe(BUSY)
     expect(details.visit_count).toBe(440_000)
     expect(details.ceiling).toBe(1000)
   })
@@ -2395,4 +2070,139 @@ test.describe('HistoryServiceWorkerModule — No tab linkage', () => {
     expect(visit).not.toHaveProperty('session_id')
     expect(visit).not.toHaveProperty('page_events_url_shown_at')
   })
+})
+
+test.describe('HistoryServiceWorkerModule — resetHistoryCollection', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/test-page.html')
+    await waitForModuleSetup(page)
+    await seedConfigAndIdentifier(page)
+    await page.evaluate(async () => {
+      await window.chrome.storage.local.set(
+        (window as any).chrome.storage.local._data
+      )
+    })
+    await page.waitForFunction(
+      () =>
+        (window as any).chrome.storage.local._data.webmunkHistoryStatus?.configSource === 'server',
+      { timeout: 5_000 }
+    )
+  })
+
+  test('reset waits out an in-flight collection instead of silently skipping', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'https://www.example.com/waited', 'Waited', now - 1000)
+
+    // Simulate a collection in flight, then release it shortly after.
+    await page.evaluate(() => {
+      const plugin = (window as any).__historyPlugin
+      plugin.status.isCollecting = true
+      setTimeout(() => { plugin.status.isCollecting = false }, 700)
+    })
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const reset = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+    )
+    expect(reset.success).toBe(true)
+
+    const events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
+  })
+
+  test('reset rewinds the walk cursor so already-collected visits are re-emitted', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'https://www.example.com/revisit', 'Revisit', now - 1000)
+
+    // First pass collects the visit and advances the cursor to "now".
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    let events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
+
+    // A second ordinary trigger finds nothing new: the cursor has passed the visit.
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const trigger = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'triggerHistoryCollection' })
+    )
+    expect(trigger.success).toBe(true)
+    events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(0)
+
+    // Reset rewinds the cursor and re-collects the same visit.
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    const reset = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+    )
+    expect(reset.success).toBe(true)
+    events = await page.evaluate(
+      () => ((window as any).__capturedEvents as Record<string, unknown>[]).filter((e) => e.name === 'rex-history-visit')
+    )
+    expect(events.length).toBe(1)
+
+    // The items counter restarts at zero on reset instead of accumulating.
+    const status = await page.evaluate(
+      () => (window as any).__sendMessage({ messageType: 'getHistoryStatus' })
+    )
+    expect(status.itemsCollected).toBe(1)
+  })
+
+  for (const collectAfterInstall of [true, false]) {
+    test(`repeated resets each re-emit the first window and are not counted as a stuck walk (collect_after_install ${collectAfterInstall})`, async ({ page }) => {
+      const lookbackDays = 7
+      const installTime = Date.now() - 60_000
+      const seed = installTime - lookbackDays * 24 * 60 * 60 * 1000
+
+      await page.evaluate((installTime) => {
+        ;(window as any).chrome.storage.local._data.rexInstallTime = installTime
+      }, installTime)
+      await seedConfigAndIdentifier(page, { lookback_days: lookbackDays, collect_after_install: collectAfterInstall })
+      await page.evaluate(async () => {
+        await window.chrome.storage.local.set(
+          (window as any).chrome.storage.local._data
+        )
+      })
+      await page.waitForFunction(
+        (collectAfterInstall) =>
+          (window as any).chrome.storage.local._data.webmunkHistoryStatus?.effectiveConfig?.collect_after_install === collectAfterInstall,
+        collectAfterInstall,
+        { timeout: 5_000 }
+      )
+
+      // One visit inside the first window after the first-run seed.
+      await addHistoryItem(page, 'https://www.example.com/first-window', 'First window', seed + 60_000)
+
+      const visitsPerReset: number[] = []
+      const stuckPerReset: number[] = []
+
+      for (let i = 0; i < 7; i++) {
+        await page.evaluate(() => { (window as any).__capturedEvents = [] })
+        const reset = await page.evaluate(
+          () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+        )
+        expect(reset.success).toBe(true)
+
+        const counts = await page.evaluate(() => {
+          const events = (window as any).__capturedEvents as Record<string, unknown>[]
+          return {
+            visits: events.filter((e) => e.name === 'rex-history-visit').length,
+            stuck: events.filter((e) => e.event_name === 'rex-history-walk-stuck').length
+          }
+        })
+        visitsPerReset.push(counts.visits)
+        stuckPerReset.push(counts.stuck)
+      }
+
+      expect(stuckPerReset).toEqual([0, 0, 0, 0, 0, 0, 0])
+      expect(visitsPerReset).toEqual([1, 1, 1, 1, 1, 1, 1])
+    })
+  }
 })

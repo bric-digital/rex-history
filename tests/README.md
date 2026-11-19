@@ -73,7 +73,6 @@ Running tests using 1 worker
   ✓ History Service Worker - URL Filtering (2)
   ✓ History Service Worker - Alarm Management (2)
   ✓ History Service Worker - Mock History Collection (3)
-  ✓ History Service Worker - Debug Logging Guards (3)
   ✓ History Service Worker - Message Handling (2)
   ✓ History Service Worker - Configuration Changes (1)
   ✓ History Service Worker - Top Domains Generation (1)
@@ -133,11 +132,6 @@ tests/
 - Retrieve mock history items
 - Filter history by startTime
 - Retrieve visits for a URL
-
-**Debug Logging Guards** (3 tests)
-- Only enable debug logging in dev extension
-- Store debug flag in storage
-- Remove debug flag if not in dev extension
 
 **Message Handling** (2 tests)
 - Respond to getHistoryStatus message

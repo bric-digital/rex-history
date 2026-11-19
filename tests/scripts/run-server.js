@@ -33,6 +33,12 @@ const server = http.createServer((request, response) => {
     return
   }
 
+  if (url.pathname === '/private/page') {
+    const marker = url.searchParams.get('marker') ?? ''
+    html(response, `<html><body><h1>Private page</h1><p>marker=${marker}</p></body></html>`)
+    return
+  }
+
   if (url.pathname === '/journey/home') {
     const marker = url.searchParams.get('marker') ?? ''
     html(response, `<html><body><h1>Journey Home</h1><a id="article-a-link" href="/journey/article-a?marker=${encodeURIComponent(marker)}">Article A</a><a id="article-b-link" href="/journey/article-b?marker=${encodeURIComponent(marker)}">Article B</a></body></html>`)
