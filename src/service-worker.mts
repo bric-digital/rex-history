@@ -1360,7 +1360,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
       }
 
       waitForIdle()
-        .then(() => chrome.storage.local.remove('webmunkHistoryLastFetch'))
+        .then(() => chrome.storage.local.remove(['webmunkHistoryLastFetch', WALK_ATTEMPT_KEY]))
         .then(() => this.collectHistory(true))
         .then(() => {
           sendResponse({ success: true })

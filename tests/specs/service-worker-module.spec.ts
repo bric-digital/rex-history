@@ -2148,4 +2148,55 @@ test.describe('HistoryServiceWorkerModule — resetHistoryCollection', () => {
     )
     expect(events.length).toBe(1)
   })
+
+  for (const collectAfterInstall of [true, false]) {
+    test(`repeated resets each re-emit the first window and are not counted as a stuck walk (collect_after_install ${collectAfterInstall})`, async ({ page }) => {
+      const lookbackDays = 7
+      const installTime = Date.now() - 60_000
+      const seed = installTime - lookbackDays * 24 * 60 * 60 * 1000
+
+      await page.evaluate((installTime) => {
+        ;(window as any).chrome.storage.local._data.rexInstallTime = installTime
+      }, installTime)
+      await seedConfigAndIdentifier(page, { lookback_days: lookbackDays, collect_after_install: collectAfterInstall })
+      await page.evaluate(async () => {
+        await window.chrome.storage.local.set(
+          (window as any).chrome.storage.local._data
+        )
+      })
+      await page.waitForFunction(
+        (collectAfterInstall) =>
+          (window as any).chrome.storage.local._data.webmunkHistoryStatus?.effectiveConfig?.collect_after_install === collectAfterInstall,
+        collectAfterInstall,
+        { timeout: 5_000 }
+      )
+
+      // One visit inside the first window after the first-run seed.
+      await addHistoryItem(page, 'https://www.example.com/first-window', 'First window', seed + 60_000)
+
+      const visitsPerReset: number[] = []
+      const stuckPerReset: number[] = []
+
+      for (let i = 0; i < 7; i++) {
+        await page.evaluate(() => { (window as any).__capturedEvents = [] })
+        const reset = await page.evaluate(
+          () => (window as any).__sendMessage({ messageType: 'resetHistoryCollection' })
+        )
+        expect(reset.success).toBe(true)
+
+        const counts = await page.evaluate(() => {
+          const events = (window as any).__capturedEvents as Record<string, unknown>[]
+          return {
+            visits: events.filter((e) => e.name === 'rex-history-visit').length,
+            stuck: events.filter((e) => e.event_name === 'rex-history-walk-stuck').length
+          }
+        })
+        visitsPerReset.push(counts.visits)
+        stuckPerReset.push(counts.stuck)
+      }
+
+      expect(stuckPerReset).toEqual([0, 0, 0, 0, 0, 0, 0])
+      expect(visitsPerReset).toEqual([1, 1, 1, 1, 1, 1, 1])
+    })
+  }
 })
