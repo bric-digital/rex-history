@@ -60,8 +60,6 @@ class HistoryExtensionModule extends REXExtensionModule {
       const config = response['history'] as {
         collection_interval_minutes?: number;
         lookback_days?: number;
-        filter_lists?: string[];
-        allow_lists?: string[];
         category_lists?: string[];
         generate_top_domains?: boolean;
         top_domains_count?: number;
@@ -71,8 +69,6 @@ class HistoryExtensionModule extends REXExtensionModule {
       if (config) {
         $('#history-config-interval').text(config.collection_interval_minutes?.toString() ?? 'N/A')
         $('#history-config-lookback').text(config.lookback_days?.toString() ?? 'N/A')
-        $('#history-config-filter-lists').text(config.filter_lists?.length ? config.filter_lists.join(', ') : 'None')
-        $('#history-config-allow-lists').text(config.allow_lists?.length ? config.allow_lists.join(', ') : 'None (all URLs allowed)')
         $('#history-config-category-lists').text(config.category_lists?.join(', ') ?? 'None')
         $('#history-config-top-domains').text(config.generate_top_domains ? 'Yes' : 'No')
         $('#history-config-top-domains-count').text(config.top_domains_count?.toString() ?? 'N/A')

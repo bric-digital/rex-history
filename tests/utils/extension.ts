@@ -160,26 +160,24 @@ export async function waitForConfigurationLoaded(serviceWorker: ServiceWorkerLik
  */
 export async function injectConfigAndIdentifier(
   serviceWorker: ServiceWorkerLike,
-  overrides: Record<string, unknown> = {}
+  overrides: Record<string, unknown> = {},
+  lists: Record<string, unknown[]> = {}
 ): Promise<void> {
-  await serviceWorker.evaluate(async (historyConfig) => {
-    await chrome.storage.local.set({
-      rexIdentifier: 'rex-history-test-user',
-      REXConfiguration: {
-        history: historyConfig,
-      },
-    })
+  await serviceWorker.evaluate(async (input) => {
+    await chrome.storage.local.set({ rexIdentifier: 'rex-history-test-user' })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (self as any).__updateConfiguration({ history: input.historyConfig, lists: input.lists })
   }, {
-    collection_interval_minutes: 60,
-    lookback_days: 30,
-    filter_lists: [],
-    allow_lists: [],
-    category_lists: [],
-    domain_only_lists: [],
-    generate_top_domains: false,
-    top_domains_count: 50,
-    top_domains_list_name: 'top-domains',
-    ...overrides,
+    historyConfig: {
+      collection_interval_minutes: 60,
+      lookback_days: 30,
+      category_lists: [],
+      generate_top_domains: false,
+      top_domains_count: 50,
+      top_domains_list_name: 'top-domains',
+      ...overrides,
+    },
+    lists,
   })
 
   await waitForConfigurationLoaded(serviceWorker)
