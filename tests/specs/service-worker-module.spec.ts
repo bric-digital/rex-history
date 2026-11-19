@@ -456,6 +456,25 @@ test.describe('HistoryServiceWorkerModule — Collection & Event Payload', () =>
     expect(events[0]!.domain).toBe('example.co.uk')
   })
 
+  test('an IP address has no registered domain', async ({ page }) => {
+    const now = Date.now()
+    await addHistoryItem(page, 'http://192.168.0.1/admin', 'Router', now - 500)
+
+    await page.evaluate(() => { (window as any).__capturedEvents = [] })
+    await page.evaluate(() => { window.triggerAlarm('rex-history-collection') })
+    await waitForCollectionComplete(page)
+
+    const events = await page.evaluate(
+      () =>
+        ((window as any).__capturedEvents as Record<string, unknown>[]).filter(
+          (e) => e.name === 'rex-history-visit' && (e.url as string).includes('192.168.0.1')
+        )
+    )
+
+    expect(events.length).toBeGreaterThanOrEqual(1)
+    expect(events[0]!.domain).toBe('not available')
+  })
+
   test('collection does not run when no identifier is set', async ({ page }) => {
     // Remove the identifier that seedConfigAndIdentifier set.
     await page.evaluate(() => {

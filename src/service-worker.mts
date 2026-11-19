@@ -927,18 +927,7 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   } {
     const url = item.url ?? ''
 
-    // Extract registered domain from URL using psl
-    let registeredDomain = 'not available'
-    try {
-      const urlObj = new URL(url)
-      const hostname = urlObj.hostname
-      const parsed = psl.parse(hostname)
-      if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-        registeredDomain = parsed.domain
-      }
-    } catch {
-      // Keep default 'not available' for invalid URLs
-    }
+    const registeredDomain = this.safeRegisteredDomain(url)
 
     return { recordedUrl: url, recordedTitle: item.title || '', registeredDomain }
   }
@@ -1133,19 +1122,17 @@ class HistoryServiceWorkerModule extends REXServiceWorkerModule {
   }
 
   /**
-   * Extract the registered domain from a URL using psl, returning 'not available'
-   * for anything unparseable. Never throws.
+   * The registered domain of a URL, or 'not available' when it has none,
+   * as for an IP address or an unparseable URL. Never throws.
    */
   private safeRegisteredDomain(url: string): string {
-    try {
-      const parsed = psl.parse(new URL(url).hostname)
-      if (parsed.error === undefined && 'domain' in parsed && parsed.domain) {
-        return parsed.domain
-      }
-    } catch {
-      // fall through to default
+    const registeredDomain = listUtils.registeredDomainOf(url)
+
+    if (registeredDomain === '') {
+      return 'not available'
     }
-    return 'not available'
+
+    return registeredDomain
   }
 
   /**
