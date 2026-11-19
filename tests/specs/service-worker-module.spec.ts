@@ -2072,9 +2072,8 @@ test.describe('HistoryServiceWorkerModule — Collection error leaves the cursor
 
 test.describe('HistoryServiceWorkerModule — Per-walk visit cache', () => {
   /**
-   * Field defect: a participant with a
-   * self-refreshing dashboard saw ~10s of lag on
-   * every page load.
+   * Field defect: a self-refreshing page with hundreds of thousands of visits
+   * on one URL caused seconds of lag on every page load.
    *
    * chrome.history.getVisits takes no time range — it returns every visit a URL
    * has ever had — and the windowed walk calls it once per URL per window, then
