@@ -8,7 +8,7 @@ type ServiceWorkerLike = {
   ) => Promise<R>
 }
 
-/** Open a page, navigate to the URL, then close it — mirrors a client extension's visitUrl. */
+/** Open a page, navigate to the URL, then close it. */
 export async function visitUrl(
   context: BrowserContext,
   url: string
@@ -23,7 +23,7 @@ export async function visitUrl(
 
 /**
  * Poll IndexedDB inside the service worker until the named list entry is present.
- * Matches a client extension's waitForAllowListEntry pattern exactly.
+ * Matches the waitForAllowListEntry pattern of a client extension's tests.
  */
 export async function waitForAllowListEntry(
   serviceWorker: ServiceWorkerLike,
@@ -80,7 +80,7 @@ export async function waitForAllowListEntry(
 /**
  * Reset the history cursor and wait for any in-progress collection to finish,
  * so the next triggerHistoryCollection picks up all visits from time 0.
- * Matches a client extension's prepareManualHistoryCollection.
+ * Matches prepareManualHistoryCollection in a client extension's tests.
  */
 export async function prepareManualHistoryCollection(serviceWorker: ServiceWorkerLike): Promise<void> {
   await serviceWorker.evaluate(async () => {
@@ -111,7 +111,7 @@ export async function triggerHistoryCollection(serviceWorker: ServiceWorkerLike)
 
 /**
  * Poll chrome.history inside the SW until all given URL substrings appear.
- * Matches a client extension's waitForHistoryEntries.
+ * Matches waitForHistoryEntries in a client extension's tests.
  */
 export async function waitForHistoryEntries(
   serviceWorker: ServiceWorkerLike,
@@ -190,7 +190,7 @@ export async function resetCapturedEvents(serviceWorker: ServiceWorkerLike): Pro
 
 /**
  * Poll __capturedEvents in the service worker until the predicate matches,
- * then return all matching events. Mirrors a client extension's waitForEventInCaptures.
+ * then return all matching events. Mirrors waitForEventInCaptures in a client extension's tests.
  */
 export async function waitForCapturedEvent(
   serviceWorker: ServiceWorkerLike,
