@@ -71,7 +71,7 @@ Every visit produces a `rex-history-visit` record. Its `url`, `recorded_url` and
 
 ### Reducing what is recorded
 
-To keep less of an address, add a content processor that runs after collection. The settings `allow_lists`, `filter_lists` and `domain_only_lists` are no longer part of the `history` configuration; they moved to the `content_processing_url_redaction` configuration of [rex-content-processing-url-redaction](https://github.com/bric-digital/rex-content-processing-url-redaction).
+To keep less of an address, add a content processor that runs after collection. The settings `allow_lists`, `filter_lists` and `domain_only_lists` are no longer part of the `history` configuration; they moved to the `content_processing_redaction_url` configuration of [rex-content-processing-redaction-url](https://github.com/bric-digital/rex-content-processing-redaction-url).
 
 ### List References
 
